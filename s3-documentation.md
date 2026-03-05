@@ -16,9 +16,13 @@ S3 API calls for its own write operations (episode downloads, cover uploads, sca
 the server to be hosted on a slow connection while end-users still enjoy high-throughput file
 delivery.
 
-AWS credentials are consumed from the standard AWS SDK environment variables
-(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_SESSION_TOKEN`). No
-in-application credential configuration UI is required.
+Each S3-backed library is independently configured with its own bucket, key prefix, AWS region,
+and S3 endpoint, allowing users to spread libraries across different buckets or regions, or to
+use S3-compatible services (MinIO, Cloudflare R2, etc.) per library. These settings are stored in
+the database and managed through the existing library settings UI. AWS credentials are consumed
+from the standard AWS SDK environment variables (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`). No in-application credential configuration UI
+is required for credentials.
 
 ---
 
@@ -123,9 +127,11 @@ media or metadata files. Database operations (SQLite) are excluded as they are o
 1. **Per-library storage type.** Each library has a `storageType` field (`local` | `s3`). Existing
    local libraries continue to work unchanged. A new library can be configured as S3-backed.
 
-2. **Server-side S3 SDK only.** The server itself uses the AWS SDK (`@aws-sdk/client-s3`,
-   `@aws-sdk/s3-request-presigner`) for all reads and writes. Credentials are provided exclusively
-   through the standard AWS environment variables — no UI configuration is needed.
+2. **Per-library S3 configuration.** Every S3-backed library carries its own `s3Bucket`,
+   `s3Region`, `s3Endpoint`, and `s3KeyPrefix` in the database. This allows multiple independent
+   S3 libraries, each pointing at a different bucket, region, prefix, or S3-compatible service.
+   AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) are the only global
+   configuration — they are shared across all S3 libraries and are not stored in the application.
 
 3. **Presigned URLs for client delivery.** When a client requests any file (audio track, ebook,
    cover image) from an S3-backed library, the server generates a short-lived read-only presigned
@@ -136,36 +142,48 @@ media or metadata files. Database operations (SQLite) are excluded as they are o
    SQLite database, and in-progress download temp files are all kept on local disk. S3 is only used
    for durable, user-visible media and metadata images.
 
-5. **New `S3StorageManager`** is the single point of contact with AWS. All other server components
-   call this manager; they do not import the AWS SDK directly.
+5. **`S3StorageManager` as a library-client factory.** Rather than a single global S3 client,
+   `S3StorageManager` is a factory that returns per-library client handles. It caches `S3Client`
+   instances keyed by `(region, endpoint)` so that libraries using the same region/endpoint share
+   an HTTP connection pool. All other server components call `S3StorageManager.getLibraryClient()`
+   and do not import the AWS SDK directly.
 
 ### 2.2 New Component: `server/managers/S3StorageManager.js`
 
-This class wraps `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner`. It is instantiated as
-a singleton and initialised from environment variables when the server starts.
+This module wraps `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner`. It acts as a
+**client factory and cache**: callers request a library-scoped client by passing the library's S3
+configuration, and the factory returns a thin `S3LibraryClient` wrapper bound to that library's
+bucket, prefix, region, and endpoint. `S3Client` instances (which own the HTTP connection pool)
+are cached and reused across libraries that share the same `(region, endpoint)` pair.
 
 **Environment variables consumed (all read-only at start-up):**
 
 | Variable | Required | Description |
 |---|---|---|
-| `S3_BUCKET` | Yes (if any S3 library is configured) | Bucket name |
-| `S3_REGION` | No | Overrides `AWS_REGION` for the S3 client |
-| `S3_KEY_PREFIX` | No | Optional prefix prepended to every object key (e.g. `audiobookshelf/`) |
-| `S3_ENDPOINT` | No | Custom endpoint URL for S3-compatible storage (e.g. MinIO, Cloudflare R2) |
-| `S3_PRESIGNED_URL_TTL_SECONDS` | No | Lifetime of generated presigned URLs; defaults to `3600` (1 hour) |
+| `S3_PRESIGNED_URL_TTL_SECONDS` | No | Lifetime of generated presigned URLs; defaults to `18000` (5 hours). A longer default is chosen because audio files are large and buffered playback sessions commonly run for several hours; a URL expiring mid-listen would interrupt playback. Reduce this value in security-sensitive deployments. |
 | `AWS_ACCESS_KEY_ID` | Yes* | Standard AWS SDK credential env var |
 | `AWS_SECRET_ACCESS_KEY` | Yes* | Standard AWS SDK credential env var |
-| `AWS_REGION` | Yes* | Standard AWS SDK region env var |
 
 \* The AWS SDK also supports IAM instance profiles, ECS task roles, etc. Explicit key/secret are
 not strictly required when running on AWS infrastructure.
 
-**Public interface of `S3StorageManager`:**
+**Public interface of `S3StorageManager` (the factory):**
 
 ```javascript
 class S3StorageManager {
-  get isEnabled()                          // true if S3_BUCKET is set
+  get presignedUrlTtlSeconds()        // S3_PRESIGNED_URL_TTL_SECONDS, default 18000
 
+  // Returns an S3LibraryClient bound to this library's config.
+  // Throws if libraryConfig is missing required fields (bucket).
+  getLibraryClient(libraryConfig)
+  // libraryConfig: { bucket, keyPrefix?, region?, endpoint? }
+}
+```
+
+**Public interface of `S3LibraryClient` (the per-library handle):**
+
+```javascript
+class S3LibraryClient {
   // Object lifecycle
   async putObject(key, bodyStream, contentType)
   async getObjectStream(key)               // returns a readable stream
@@ -180,27 +198,36 @@ class S3StorageManager {
   async getPresignedPutUrl(key, ttlSeconds?) // returns a time-limited PUT URL (for future direct upload)
 
   // Key helpers
-  buildKey(relPath)                        // prepend S3_KEY_PREFIX to a relative path
-  keyToRelPath(key)                        // strip S3_KEY_PREFIX to get a relative path
+  buildKey(relPath)                        // prepend keyPrefix to a relative path
+  keyToRelPath(key)                        // strip keyPrefix to get a relative path
 }
 ```
 
 ### 2.3 S3 Object Key Convention
 
-S3 object keys mirror the relative path structure that already exists on disk. The `S3_KEY_PREFIX`
-(if set) acts like a virtual root folder inside the bucket, so multiple Audiobookshelf instances
-can share a bucket.
+S3 object keys are formed by joining the library's `s3KeyPrefix` (stored in the `Library` record)
+with the item's relative path within the library. The `s3KeyPrefix` acts as the virtual root
+folder for this library inside its bucket — equivalent to the library's local folder path.
 
-| Content | Local path example | S3 key example (no prefix) |
-|---|---|---|
-| Audio file | `/audiobooks/Terry Pratchett/Guards Guards/Guards Guards.m4b` | `library/{libraryId}/Terry Pratchett/Guards Guards/Guards Guards.m4b` |
-| Episode file | `/podcasts/My Podcast/episode-001.mp3` | `library/{libraryId}/My Podcast/episode-001.mp3` |
-| Item cover | `/config/metadata/items/li_abc123/cover.jpg` | `metadata/items/li_abc123/cover.jpg` |
-| Author image | `/config/metadata/authors/au_xyz789.jpg` | `metadata/authors/au_xyz789.jpg` |
-| Ebook file | `/audiobooks/Author/Book/Book.epub` | `library/{libraryId}/Author/Book/Book.epub` |
+Because every library has its own bucket and/or key prefix, no additional `library/{libraryId}/`
+wrapper is needed in the key: the prefix alone is sufficient to separate libraries that share a
+bucket.
 
-The `library/{libraryId}/` prefix is derived from the library's database ID so multiple libraries
-in the same bucket are kept separate.
+| Content | Local path example | S3 key (with `s3KeyPrefix = "audiobooks/"`) | S3 key (no prefix) |
+|---|---|---|---|
+| Audio file | `/audiobooks/Terry Pratchett/Guards Guards/Guards Guards.m4b` | `audiobooks/Terry Pratchett/Guards Guards/Guards Guards.m4b` | `Terry Pratchett/Guards Guards/Guards Guards.m4b` |
+| Episode file | `/podcasts/My Podcast/episode-001.mp3` | `podcasts/My Podcast/episode-001.mp3` | `My Podcast/episode-001.mp3` |
+| Item cover (stored with item) | `/audiobooks/Author/Book/cover.jpg` | `audiobooks/Author/Book/cover.jpg` | `Author/Book/cover.jpg` |
+| Item cover (metadata folder) | `/config/metadata/items/li_abc123/cover.jpg` | `audiobooks/.abs/metadata/items/li_abc123/cover.jpg` | `.abs/metadata/items/li_abc123/cover.jpg` |
+| Ebook file | `/audiobooks/Author/Book/Book.epub` | `audiobooks/Author/Book/Book.epub` | `Author/Book/Book.epub` |
+
+Server-managed metadata (cover images stored in the metadata folder when `storeCoverWithItem` is
+`false`) are stored inside a `.abs/metadata/` sub-directory appended to the library's own
+`s3KeyPrefix`. For example, if `s3KeyPrefix = 'audiobooks/'`, item covers go to
+`audiobooks/.abs/metadata/items/{libraryItemId}/cover.jpg`. This keeps all data for a library
+self-contained under its prefix and avoids any collision with actual media files. Author images
+remain on local disk because they are not library-specific (an author can appear across multiple
+libraries).
 
 ### 2.4 Data Flow — File Serving (current vs. proposed)
 
@@ -215,7 +242,8 @@ Client → GET /api/items/:id/file/:fileid
 **Proposed (S3-backed library):**
 ```
 Client → GET /api/items/:id/file/:fileid
-           → Server: S3StorageManager.getPresignedGetUrl(key)
+           → Server: libraryClient = S3StorageManager.getLibraryClient(library.s3Config)
+           → Server: libraryClient.getPresignedGetUrl(key)
            → HTTP 302 Location: https://s3.amazonaws.com/bucket/key?X-Amz-Signature=…
                                            ↓
                             Client downloads directly from S3
@@ -239,9 +267,9 @@ External RSS URL → ffmpeg / axios → local disk file → LibraryFile.setDataF
 
 **Podcast episode download (proposed, S3 library):**
 ```
-External RSS URL → ffmpeg / axios → temp local file → S3StorageManager.putObject(key, stream)
+External RSS URL → ffmpeg / axios → temp local file → libraryClient.putObject(key, stream)
                                                     → fs.unlink(tempFile)
-                                                    → libraryFile metadata populated from S3 HeadObject
+                                                    → libraryFile metadata populated from S3 headObject
 ```
 
 **Cover upload (current):**
@@ -252,7 +280,7 @@ Multipart POST → temp file → CoverManager.uploadCover() → fs.mv() → loca
 **Cover upload (proposed, S3 library):**
 ```
 Multipart POST → temp file → CoverManager.uploadCover()
-                                → S3StorageManager.putObject(coverKey, readStream)
+                                → libraryClient.putObject(coverKey, readStream)
                                 → fs.unlink(tempFile)
 ```
 
@@ -260,52 +288,90 @@ Multipart POST → temp file → CoverManager.uploadCover()
 
 ## 3. Component-by-Component Change Plan
 
-### 3.1 Library Model — Add `storageType`
+### 3.1 Library Model — Add S3 configuration fields
 
 **File:** `server/models/Library.js`
 
-Add a new column to the `Library` Sequelize model and corresponding DB migration:
+Add new columns to the `Library` Sequelize model and corresponding DB migration:
 
 ```javascript
 storageType: {
   type: DataTypes.STRING,
   allowNull: false,
   defaultValue: 'local'   // existing libraries remain unchanged
+},
+s3Bucket: {
+  type: DataTypes.STRING,
+  allowNull: true          // null for local libraries
+},
+s3Region: {
+  type: DataTypes.STRING,
+  allowNull: true          // null → AWS SDK default / AWS_REGION env var
+},
+s3Endpoint: {
+  type: DataTypes.STRING,
+  allowNull: true          // null for standard AWS S3; set for MinIO, R2, etc.
+},
+s3KeyPrefix: {
+  type: DataTypes.STRING,
+  allowNull: true          // null / '' → no prefix; e.g. 'audiobooks/' or 'podcasts/fiction/'
 }
 ```
 
-A `storageType: 's3'` library also requires `libraryId` to be known at key-building time, which is
-already available everywhere `libraryItem.libraryId` is accessible.
+A helper `library.s3Config` getter on the model assembles these fields into the shape expected
+by `S3StorageManager.getLibraryClient()`:
+
+```javascript
+get s3Config() {
+  if (this.storageType !== 's3') return null
+  return {
+    bucket: this.s3Bucket,
+    keyPrefix: this.s3KeyPrefix || '',
+    region: this.s3Region || undefined,
+    endpoint: this.s3Endpoint || undefined
+  }
+}
+```
 
 **Migration file:** `server/migrations/v2.XX.0-add-library-storage-type.js`
 
 ### 3.2 New File: `server/managers/S3StorageManager.js`
 
-Implement the interface described in §2.2. Key implementation notes:
+Implement the factory interface described in §2.2. Key implementation notes:
 
 - Use `@aws-sdk/client-s3` v3 modular client (smaller bundle, tree-shakeable).
 - Use `@aws-sdk/s3-request-presigner` for `getSignedUrl`.
-- The singleton instance is exported from the module; a lazy `init()` call (called at server start)
-  reads env vars and creates the `S3Client` instance.
-- All methods are no-ops (or throw a clear error) if `isEnabled` is `false`, so callers can safely
-  call them and check `isEnabled` to branch.
+- `S3StorageManager` is exported as a singleton module. It maintains an internal cache of
+  `S3Client` instances keyed by a composite string of `region` and `endpoint`
+  (e.g. `JSON.stringify({ region, endpoint })`) to reuse HTTP connection pools
+  across libraries that share the same region and endpoint.
+- `getLibraryClient(libraryConfig)` validates that `libraryConfig.bucket` is present and
+  returns a new `S3LibraryClient` instance (lightweight wrapper — instantiation is cheap).
+- `S3LibraryClient` closes over the cached `S3Client` and the library's `bucket`/`keyPrefix`.
+- The presigned URL TTL is read once from `S3_PRESIGNED_URL_TTL_SECONDS` at module load
+  (default `18000`); it is accessible via `S3StorageManager.presignedUrlTtlSeconds`.
 
 **New dependency:** `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner`
 
-### 3.3 Helper: `isS3Library(libraryIdOrObject)`
+### 3.3 Helper: `isS3Library(libraryIdOrObject)` and `getLibraryS3Config(libraryIdOrObject)`
 
-A utility (can live in `server/utils/storageUtils.js`) that returns `true` when a library has
-`storageType === 's3'`. The helper accepts any of:
+Two utilities in `server/utils/storageUtils.js`:
+
+**`isS3Library(libraryIdOrObject)`** returns `true` when a library has `storageType === 's3'`.
+The helper accepts any of:
 
 - A **`Library` model instance** — reads `library.storageType` directly.
 - A **`LibraryItem` model instance** — reads `libraryItem.library?.storageType` if the association
   is already loaded, otherwise falls back to a cached lookup by `libraryItem.libraryId`.
-- A **library ID string** — looks up the library from the in-memory `Database.libraryModel` cache.
+- A **library ID string** — looks up the library from the in-memory cache.
+
+**`getLibraryS3Config(libraryIdOrObject)`** returns the full S3 configuration object
+`{ bucket, keyPrefix, region, endpoint }` for an S3 library, or `null` for a local library.
 
 Because `Library` records are small and rarely change, the server should maintain an in-memory
-map of `libraryId → storageType` that is refreshed whenever a library is updated. This avoids
-a SQL round-trip on every file-serve request. All branching in controllers and managers uses
-`isS3Library()` to keep the logic readable.
+map of `libraryId → { storageType, s3Bucket, s3KeyPrefix, s3Region, s3Endpoint }` that is
+refreshed whenever a library is created or updated. This avoids a SQL round-trip on every
+file-serve request. All branching in controllers and managers uses these helpers.
 
 ### 3.4 `server/controllers/SessionController.js` — `getTrack()`
 
@@ -314,9 +380,11 @@ a SQL round-trip on every file-serve request. All branching in controllers and m
 **Proposed change:**
 
 ```javascript
-if (isS3Library(playbackSession.libraryId)) {
-  const key = S3StorageManager.buildKey(audioTrack.metadata.relPath, playbackSession.libraryId)
-  const url = await S3StorageManager.getPresignedGetUrl(key)
+const s3Config = getLibraryS3Config(playbackSession.libraryId)
+if (s3Config) {
+  const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+  const key = libraryClient.buildKey(audioTrack.metadata.relPath)
+  const url = await libraryClient.getPresignedGetUrl(key)
   return res.redirect(url)
 }
 // existing local path …
@@ -336,16 +404,14 @@ Multiple endpoints need the redirect treatment:
 | `downloadLibraryItem()` | Single-file S3 items: presigned redirect. Multi-file items: stream objects from S3 into the zip pipe. |
 | `getCover()` | If S3 library → presigned URL redirect for cover key |
 | `getEbook()` | If S3 library → presigned URL redirect for ebook key |
-| `deleteCover()` | If S3 library → `S3StorageManager.deleteObject(coverKey)` |
-| `deleteLibraryItem()` | If S3 library → `S3StorageManager.deleteObjects(allItemKeys)` (list prefix first) |
-| `deleteLibraryFile()` | If S3 library → `S3StorageManager.deleteObject(fileKey)` |
+| `deleteCover()` | If S3 library → `libraryClient.deleteObject(coverKey)` |
+| `deleteLibraryItem()` | If S3 library → `libraryClient.deleteObjects(allItemKeys)` (list prefix first) |
+| `deleteLibraryFile()` | If S3 library → `libraryClient.deleteObject(fileKey)` |
 
 ### 3.6 `server/controllers/AuthorController.js`
 
-| Method | Change |
-|---|---|
-| `getImage()` | If S3 library (or globally, since author images are server-managed) → presigned URL redirect using the author image key |
-| `deleteImage()` | `S3StorageManager.deleteObject(authorImageKey)` |
+Author images are stored on local disk regardless of library storage type (see §3.10). No changes
+are required to `AuthorController.getImage()` or `AuthorController.deleteImage()`.
 
 ### 3.7 `server/controllers/ShareController.js`
 
@@ -402,27 +468,28 @@ S3. Cached resized images do not need to be stored in S3.
 
 ### 3.10 `server/finders/AuthorFinder.js` — `saveAuthorImage()`
 
-```javascript
-if (S3StorageManager.isEnabled) {
-  // download to OS temp dir
-  const tmpPath = Path.join(os.tmpdir(), `author-${authorId}-${Date.now()}.jpg`)
-  await downloadImageFile(url, tmpPath)
-  const key = S3StorageManager.buildKey(`metadata/authors/${authorId}.jpg`)
-  await S3StorageManager.putObject(key, fs.createReadStream(tmpPath))
-  await fs.unlink(tmpPath)
-  return { path: key }
-}
-// existing local path …
-```
+Author images are server-managed metadata that can be shared across multiple libraries (the same
+author may appear in several libraries, each potentially using a different S3 bucket). Because
+there is no single canonical bucket for server-managed metadata, **author images continue to be
+stored on local disk** at `MetadataPath/authors/{authorId}.jpg`. No changes are required to
+`AuthorFinder.saveAuthorImage()`.
+
+The `AuthorController.getImage()` and `CacheManager.handleAuthorCache()` endpoints are
+therefore also unchanged — they continue to serve author images from the local filesystem.
+
+> **Future enhancement:** A dedicated `S3_METADATA_BUCKET` / `S3_METADATA_REGION` env var pair
+> could be introduced to allow author images and other server-managed metadata to be stored in a
+> single global S3 location, but this is out of scope for the current plan.
 
 ### 3.11 `server/managers/PodcastManager.js` — `startPodcastEpisodeDownload()`
 
 ```javascript
 // After successful ffmpeg download to this.currentDownload.targetPath …
-if (isS3Library(this.currentDownload.libraryItem.libraryId)) {
-  const key = S3StorageManager.buildKey(this.currentDownload.targetRelPath,
-                                        this.currentDownload.libraryItem.libraryId)
-  await S3StorageManager.putObject(key, fs.createReadStream(this.currentDownload.targetPath))
+const s3Config = getLibraryS3Config(this.currentDownload.libraryItem.libraryId)
+if (s3Config) {
+  const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+  const key = libraryClient.buildKey(this.currentDownload.targetRelPath)
+  await libraryClient.putObject(key, fs.createReadStream(this.currentDownload.targetPath))
   await fs.unlink(this.currentDownload.targetPath)
 }
 // scan/probe logic follows, using the key or local path accordingly
@@ -444,11 +511,12 @@ This is the most complex write-back scenario. It may be deferred to a later impl
 
 ### 3.13 `server/objects/files/LibraryFile.js` — `setDataFromPath()`
 
-Add an S3-aware variant:
+Add an S3-aware variant. The caller passes the `S3LibraryClient` instance for the library,
+which is already required to have resolved the library config before calling this method:
 
 ```javascript
-async setDataFromS3Key(key, relPath) {
-  const meta = await S3StorageManager.headObject(key)
+async setDataFromS3Key(key, relPath, libraryClient) {
+  const meta = await libraryClient.headObject(key)
   this.ino = key        // use key as the stable inode equivalent
   this.metadata.filename = Path.basename(relPath)
   this.metadata.ext = Path.extname(relPath)
@@ -472,13 +540,13 @@ work with key-based identifiers.
 
 ```javascript
 if (library.storageType === 's3') {
-  const prefix = S3StorageManager.buildKey(`library/${library.id}/`)
-  const s3Objects = await S3StorageManager.listObjects(prefix)
+  const libraryClient = S3StorageManager.getLibraryClient(library.s3Config)
+  const s3Objects = await libraryClient.listObjects('')   // list from root of library prefix
   fileItems = s3Objects.map(obj => ({
     fullpath: obj.key,
-    path: S3StorageManager.keyToRelPath(obj.key).replace(`library/${library.id}/`, ''),
+    path: libraryClient.keyToRelPath(obj.key),
     extension: Path.extname(obj.key),
-    deep: obj.key.split('/').length - prefix.split('/').length - 1,
+    deep: libraryClient.keyToRelPath(obj.key).split('/').length - 1,
     size: obj.size,
     mtimeMs: obj.lastModified.getTime()
   }))
@@ -494,7 +562,7 @@ The filesystem watcher (`chokidar`) has no meaning for S3-backed libraries. Two 
 
 - **Option A (simple):** Simply do not start `chokidar` for S3 libraries. Re-scan must be triggered
   manually from the UI or on a schedule.
-- **Option B (polling):** Periodically call `S3StorageManager.listObjects(prefix)` and diff against
+- **Option B (polling):** Periodically call `libraryClient.listObjects(prefix)` and diff against
   the last known list. Trigger a library item re-scan when new objects appear. This is equivalent
   to chokidar's polling mode.
 
@@ -516,9 +584,11 @@ intermediate download is necessary.
 ```javascript
 // In Stream.js startTranscode() or equivalent:
 let inputPath = this.audioFile.metadata.path
-if (isS3Library(this.libraryId)) {
-  const key = S3StorageManager.buildKey(this.audioFile.metadata.relPath, this.libraryId)
-  inputPath = await S3StorageManager.getPresignedGetUrl(key, 3600)
+const s3Config = getLibraryS3Config(this.libraryId)
+if (s3Config) {
+  const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+  const key = libraryClient.buildKey(this.audioFile.metadata.relPath)
+  inputPath = await libraryClient.getPresignedGetUrl(key, S3StorageManager.presignedUrlTtlSeconds)
 }
 // ffmpeg -i inputPath …
 ```
@@ -530,20 +600,28 @@ if (isS3Library(this.libraryId)) {
 ### 4.1 Creating an S3 Library
 
 When a user creates a new library in the Audiobookshelf UI and selects "S3" as the storage type,
-the following information is required in addition to the existing library settings:
+the following additional fields must be provided:
 
-- **S3 Key Prefix for this library** — the sub-path within the bucket where this library's media
-  files live (e.g. `audiobooks/` or `podcasts/fiction/`). This is stored in the `Library` record.
+| Field | Required | Description |
+|---|---|---|
+| **S3 Bucket** | Yes | The name of the S3 bucket that holds this library's files |
+| **S3 Key Prefix** | No | Sub-path within the bucket acting as the library root (e.g. `audiobooks/` or `podcasts/thriller/`). Leave blank if the bucket is dedicated to this library. |
+| **S3 Region** | No | AWS region of the bucket (e.g. `us-east-1`). Falls back to the `AWS_REGION` env var if omitted. |
+| **S3 Endpoint** | No | Custom endpoint URL for S3-compatible storage (MinIO, Cloudflare R2, etc.). Leave blank for standard AWS S3. |
 
-The global `S3_BUCKET`, `S3_REGION`, and AWS credentials are shared across all S3 libraries. A
-library-level prefix allows multiple libraries in the same bucket.
+Multiple S3 libraries may use the same bucket (differentiated by distinct `s3KeyPrefix` values),
+different buckets in the same region, or entirely separate buckets in different regions or even
+different S3-compatible services.
 
 ### 4.2 Library Model Changes
 
 ```javascript
 // New fields on the Library Sequelize model
-storageType:    DataTypes.STRING  // 'local' | 's3', default 'local'
-s3KeyPrefix:    DataTypes.STRING  // null for local; e.g. 'audiobooks/' for S3
+storageType:  DataTypes.STRING  // 'local' | 's3', default 'local'
+s3Bucket:     DataTypes.STRING  // required when storageType = 's3'
+s3KeyPrefix:  DataTypes.STRING  // optional; e.g. 'audiobooks/'
+s3Region:     DataTypes.STRING  // optional; falls back to AWS_REGION env var
+s3Endpoint:   DataTypes.STRING  // optional; custom endpoint for S3-compatible storage
 ```
 
 ---
@@ -552,7 +630,8 @@ s3KeyPrefix:    DataTypes.STRING  // null for local; e.g. 'audiobooks/' for S3
 
 Currently `libraryItem.media.coverPath` is an absolute local filesystem path (e.g.
 `/config/metadata/items/li_abc/cover.jpg`). For S3 libraries, this field must store the S3 object
-key instead (e.g. `metadata/items/li_abc/cover.jpg`).
+key instead (e.g. `audiobooks/.abs/metadata/items/li_abc/cover.jpg` when `s3KeyPrefix =
+'audiobooks/'`).
 
 To maintain backwards compatibility and allow the code to tell the two formats apart:
 - Local paths always start with `/` (POSIX) or a drive letter (Windows).
@@ -584,14 +663,20 @@ Migrating an existing local library to S3 is a data operation, not a code change
 flow (documented for users, not automated by the application at this stage):
 
 1. User creates an S3 bucket and configures AWS credentials via environment variables.
-2. User uploads their existing library folder tree to the bucket using the AWS CLI or S3 sync tool:
-   `aws s3 sync /audiobooks/ s3://my-bucket/library/lib_id_here/`
-3. User uploads the metadata covers and author images:
-   `aws s3 sync /config/metadata/items/ s3://my-bucket/metadata/items/`
-   `aws s3 sync /config/metadata/authors/ s3://my-bucket/metadata/authors/`
-4. User changes the library `storageType` to `s3` and sets the `s3KeyPrefix` in the UI.
+2. User uploads their existing library folder tree to the bucket using the AWS CLI or S3 sync tool,
+   matching the intended `s3KeyPrefix`:
+   `aws s3 sync /audiobooks/ s3://my-bucket/audiobooks/`
+3. If covers are stored in the metadata folder (`storeCoverWithItem = false`), upload them into the
+   `.abs/metadata/` sub-directory within the library prefix (the `.abs/metadata/` suffix is
+   literal, not a placeholder):
+   `aws s3 sync /config/metadata/items/ s3://my-bucket/audiobooks/.abs/metadata/items/`
+4. User changes the library `storageType` to `s3` in the UI and fills in `s3Bucket`,
+   `s3KeyPrefix`, `s3Region`, and `s3Endpoint` as appropriate.
 5. User triggers a full library re-scan so the server updates `libraryFile.metadata.path` records
    from local paths to S3 keys.
+
+Each library is migrated independently, so a mixed deployment (some libraries local, some S3) is
+fully supported and requires no special configuration beyond the per-library settings above.
 
 ---
 
@@ -600,9 +685,10 @@ flow (documented for users, not automated by the application at this stage):
 ### Phase 1 — Foundation
 
 1. Add `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner` to `package.json`.
-2. Implement `server/managers/S3StorageManager.js`.
-3. Add `storageType` / `s3KeyPrefix` columns to `Library` model + write the DB migration.
-4. Implement `server/utils/storageUtils.js` (`isS3Library`, `isS3Key` helpers).
+2. Implement `server/managers/S3StorageManager.js` (factory + `S3LibraryClient`).
+3. Add `storageType`, `s3Bucket`, `s3Region`, `s3Endpoint`, `s3KeyPrefix` columns to `Library`
+   model + write the DB migration.
+4. Implement `server/utils/storageUtils.js` (`isS3Library`, `getLibraryS3Config`, `isS3Key` helpers).
 
 ### Phase 2 — File Serving (read path, highest impact)
 
@@ -638,7 +724,7 @@ flow (documented for users, not automated by the application at this stage):
 ### Phase 7 — Delete Operations
 
 19. Update `deleteLibraryItem()`, `deleteLibraryFile()`, `deleteCover()`, `deleteAuthorImage()`
-    to use `S3StorageManager.deleteObject(s)` for S3 libraries.
+    to use `libraryClient.deleteObject(s)` for S3 libraries.
 
 ---
 
@@ -649,15 +735,15 @@ flow (documented for users, not automated by the application at this stage):
 | File | Purpose |
 |---|---|
 | `server/managers/S3StorageManager.js` | AWS S3 SDK wrapper singleton |
-| `server/utils/storageUtils.js` | `isS3Library()`, `isS3Key()` helpers |
-| `server/migrations/v2.XX.0-add-library-storage-type.js` | DB migration adding `storageType` and `s3KeyPrefix` to `Libraries` table |
+| `server/utils/storageUtils.js` | `isS3Library()`, `getLibraryS3Config()`, `isS3Key()` helpers |
+| `server/migrations/v2.XX.0-add-library-storage-type.js` | DB migration adding `storageType`, `s3Bucket`, `s3Region`, `s3Endpoint`, `s3KeyPrefix` to `Libraries` table |
 
 ### Modified files
 
 | File | Nature of change |
 |---|---|
 | `package.json` | Add `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner` |
-| `server/models/Library.js` | Add `storageType`, `s3KeyPrefix` Sequelize fields |
+| `server/models/Library.js` | Add `storageType`, `s3Bucket`, `s3Region`, `s3Endpoint`, `s3KeyPrefix` Sequelize fields; add `s3Config` getter |
 | `server/managers/S3StorageManager.js` | *(new)* |
 | `server/managers/CoverManager.js` | S3 branches in all write operations |
 | `server/managers/CacheManager.js` | Source cover/author images from S3 when key is S3 key |
@@ -666,7 +752,7 @@ flow (documented for users, not automated by the application at this stage):
 | `server/finders/AuthorFinder.js` | Upload author image to S3 |
 | `server/controllers/SessionController.js` | Presigned URL redirect for S3 audio tracks |
 | `server/controllers/LibraryItemController.js` | Presigned URL redirect for S3 file/cover/ebook; S3 delete |
-| `server/controllers/AuthorController.js` | Presigned URL redirect / S3 delete for author images |
+| `server/controllers/AuthorController.js` | No S3 changes required (author images remain on local disk) |
 | `server/controllers/ShareController.js` | Presigned URL redirect for shared item track/cover |
 | `server/scanner/LibraryScanner.js` | `listObjects` for S3 library folder scan |
 | `server/objects/files/LibraryFile.js` | Add `setDataFromS3Key()` method |
@@ -680,9 +766,13 @@ flow (documented for users, not automated by the application at this stage):
 The following are explicitly excluded from this plan, as agreed in the requirements:
 
 - SQLite database — always stored on local disk.
-- Application server configuration UI for AWS credentials (credentials come from env vars only).
+- AWS credential configuration in the application UI — `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY` are environment variables only; per-library S3 settings (bucket,
+  region, endpoint, prefix) are stored in the database and managed through the UI.
 - S3 support for backup archives (`BackupManager`) — backups cover the database, which stays local.
 - HLS transcode segment storage in S3 — segments are ephemeral and always local.
 - Resize cache storage in S3 — derived images are always local.
+- Author image storage in S3 — author images are server-managed metadata that span multiple
+  libraries, and are stored on local disk.
 - Direct-to-S3 browser uploads (presigned PUT URLs) — a future optimisation.
 - Automatic migration tooling for existing local libraries to S3.
