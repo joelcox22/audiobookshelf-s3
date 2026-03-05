@@ -4,9 +4,9 @@
 
 This document analyses the current filesystem architecture of Audiobookshelf and produces a
 detailed plan for adding AWS S3 as an optional storage backend for audiobook/podcast media files
-and their associated metadata images (covers, author images). The SQLite database and ephemeral
-server-side state (HLS transcode segments, resize cache) are explicitly out of scope and will
-remain on local disk.
+and their associated metadata images (covers, author images) and image resize cache. The SQLite
+database and ephemeral server-side state (HLS transcode segments) are explicitly out of scope and
+will remain on local disk.
 
 The primary user-experience goal is that **all network-heavy client requests—audio file streaming,
 cover images, ebook downloads—bypass the Audiobookshelf server entirely and are served directly
@@ -220,6 +220,7 @@ bucket.
 | Item cover (stored with item) | `/audiobooks/Author/Book/cover.jpg` | `audiobooks/Author/Book/cover.jpg` | `Author/Book/cover.jpg` |
 | Item cover (metadata folder) | `/config/metadata/items/li_abc123/cover.jpg` | `audiobooks/.abs/metadata/items/li_abc123/cover.jpg` | `.abs/metadata/items/li_abc123/cover.jpg` |
 | Ebook file | `/audiobooks/Author/Book/Book.epub` | `audiobooks/Author/Book/Book.epub` | `Author/Book/Book.epub` |
+| Resized cover | `/config/metadata/cache/covers/li_abc123_300x300.webp` | `audiobooks/__resize_cache__/covers/li_abc123_300x300.webp` | `__resize_cache__/covers/li_abc123_300x300.webp` |
 
 Server-managed metadata (cover images stored in the metadata folder when `storeCoverWithItem` is
 `false`) are stored inside a `.abs/metadata/` sub-directory appended to the library's own
@@ -443,28 +444,57 @@ CacheManager then detect this format to resolve it correctly.
 
 ### 3.9 `server/managers/CacheManager.js`
 
-The resize cache remains local. The source image for resizing comes from S3 for S3-backed
-libraries.
+For S3-backed libraries the resize cache is **stored in S3** under the library's own bucket and
+key prefix, using a `__resize_cache__/` sub-prefix. This means resized images are served via
+presigned URL redirects just like all other S3 content, and the local disk is not needed for
+cache storage when the library is S3-backed.
 
-**`handleCoverCache(res, libraryItemId, options)`:**
+#### Resize cache key convention
 
 ```
-1. If cached resized file exists locally → serve it as today (redirect or stream).
-2. If not cached:
-   a. Get coverPath from DB.
-   b. If coverPath is an S3 key (S3 library):
-      - Stream from S3 to a local temp file.
-      - Resize local temp file into the cache path.
-      - Delete the local temp file.
-   c. Else (local library):
-      - Existing logic: resize directly from coverPath.
-3. Redirect or stream the cached file.
+{s3KeyPrefix}__resize_cache__/covers/{libraryItemId}_{width}x{height}.webp
 ```
 
-**`handleAuthorCache`:** Same pattern — source from S3 if author image key is an S3 key.
+For example, with `s3KeyPrefix = 'audiobooks/'`:
+```
+audiobooks/__resize_cache__/covers/li_abc123_300x300.webp
+```
 
-The key insight is that the cache itself always stays local; only the *source* of truth moves to
-S3. Cached resized images do not need to be stored in S3.
+The `__resize_cache__` component is a reserved prefix. The server will treat any path component
+that begins with `__resize_cache__` as server-generated content and will refuse to register it
+as a media file path during library scanning. Users should avoid naming library folders or files
+with this prefix, and the scanner will emit a warning if it encounters one.
+
+#### **`handleCoverCache(res, libraryItemId, options)`** — proposed S3 flow
+
+```
+1. Get the library s3Config for this libraryItemId.
+2. If S3 library:
+   a. Build the resize cache key:
+      cacheKey = libraryClient.buildKey(`__resize_cache__/covers/${libraryItemId}_${w}x${h}.webp`)
+   b. If headObject(cacheKey) returns metadata → presigned URL redirect (cache hit).
+   c. Cache miss:
+      - Get the source cover S3 key from DB (coverPath stored as S3 key).
+      - Stream the source cover from S3 to a local OS temp file.
+      - Resize the temp file (sharp/ffmpeg) into a second local temp file.
+      - Upload the resized temp file to S3 at cacheKey via putObject().
+      - Delete both local temp files.
+      - Presigned URL redirect to the newly cached object.
+3. If local library:
+   - Existing logic unchanged (local disk cache).
+```
+
+#### **`handleAuthorCache`**
+
+Author images remain on local disk (see §3.10), so `handleAuthorCache` continues to use the
+existing local disk cache logic unchanged.
+
+#### Cache purge operations
+
+| Method | Change |
+|---|---|
+| `purgeAll()` | If S3 library: `libraryClient.deleteObjects(await libraryClient.listObjects('__resize_cache__/'))` — the S3 delete replaces the local `fs.remove(this.CachePath)` for that library (no local cache files are written for S3 libraries, so no local cleanup is needed) |
+| `purge(libraryItemId)` | If S3 library: list objects matching `__resize_cache__/covers/${libraryItemId}_*` → `deleteObjects(keys)` |
 
 ### 3.10 `server/finders/AuthorFinder.js` — `saveAuthorImage()`
 
@@ -696,8 +726,9 @@ fully supported and requires no special configuration beyond the per-library set
 6. Update `LibraryItemController.getFile()`, `downloadFile()`, `getCover()`, `getEbook()`.
 7. Update `ShareController.getSharedItemCover()`, `getSharedItemTrack()`.
 8. Update `AuthorController.getImage()`.
-9. Update `CacheManager.handleCoverCache()` and `handleAuthorCache()` to source images from S3
-   when needed (for the resize step), but keep the resize cache on local disk.
+9. Update `CacheManager.handleCoverCache()` to source the cover from S3, resize it, store the
+   resized image back to S3 under `__resize_cache__/covers/`, and serve via presigned URL redirect.
+   Keep `handleAuthorCache()` on local disk (author images stay local).
 
 ### Phase 3 — Write Path
 
@@ -746,7 +777,7 @@ fully supported and requires no special configuration beyond the per-library set
 | `server/models/Library.js` | Add `storageType`, `s3Bucket`, `s3Region`, `s3Endpoint`, `s3KeyPrefix` Sequelize fields; add `s3Config` getter |
 | `server/managers/S3StorageManager.js` | *(new)* |
 | `server/managers/CoverManager.js` | S3 branches in all write operations |
-| `server/managers/CacheManager.js` | Source cover/author images from S3 when key is S3 key |
+| `server/managers/CacheManager.js` | S3 libraries: store resized cover images in S3 under `__resize_cache__/`; serve via presigned URL; S3-aware purge; `handleAuthorCache` unchanged |
 | `server/managers/PodcastManager.js` | Upload downloaded episode to S3 |
 | `server/managers/AudioMetadataManager.js` | Download-modify-upload for S3 libraries (Phase 6) |
 | `server/finders/AuthorFinder.js` | Upload author image to S3 |
@@ -771,7 +802,6 @@ The following are explicitly excluded from this plan, as agreed in the requireme
   region, endpoint, prefix) are stored in the database and managed through the UI.
 - S3 support for backup archives (`BackupManager`) — backups cover the database, which stays local.
 - HLS transcode segment storage in S3 — segments are ephemeral and always local.
-- Resize cache storage in S3 — derived images are always local.
 - Author image storage in S3 — author images are server-managed metadata that span multiple
   libraries, and are stored on local disk.
 - Direct-to-S3 browser uploads (presigned PUT URLs) — a future optimisation.
