@@ -46,6 +46,16 @@ class Library extends Model {
     this.updatedAt
     /** @type {import('./LibraryFolder')[]|undefined} */
     this.libraryFolders
+    /** @type {string} - 'local' | 's3' */
+    this.storageType
+    /** @type {string|null} */
+    this.s3Bucket
+    /** @type {string|null} */
+    this.s3Region
+    /** @type {string|null} */
+    this.s3Endpoint
+    /** @type {string|null} */
+    this.s3KeyPrefix
   }
 
   /**
@@ -167,7 +177,28 @@ class Library extends Model {
         lastScan: DataTypes.DATE,
         lastScanVersion: DataTypes.STRING,
         settings: DataTypes.JSON,
-        extraData: DataTypes.JSON
+        extraData: DataTypes.JSON,
+        storageType: {
+          type: DataTypes.STRING,
+          allowNull: false,
+          defaultValue: 'local'
+        },
+        s3Bucket: {
+          type: DataTypes.STRING,
+          allowNull: true
+        },
+        s3Region: {
+          type: DataTypes.STRING,
+          allowNull: true
+        },
+        s3Endpoint: {
+          type: DataTypes.STRING,
+          allowNull: true
+        },
+        s3KeyPrefix: {
+          type: DataTypes.STRING,
+          allowNull: true
+        }
       },
       {
         sequelize,
@@ -187,6 +218,20 @@ class Library extends Model {
    */
   get lastScanMetadataPrecedence() {
     return this.extraData?.lastScanMetadataPrecedence || []
+  }
+
+  /**
+   * Returns S3 configuration for this library, or null if it is a local library.
+   * @returns {{ bucket: string, keyPrefix: string, region?: string, endpoint?: string }|null}
+   */
+  get s3Config() {
+    if (this.storageType !== 's3') return null
+    return {
+      bucket: this.s3Bucket,
+      keyPrefix: this.s3KeyPrefix || '',
+      region: this.s3Region || undefined,
+      endpoint: this.s3Endpoint || undefined
+    }
   }
 
   /**
@@ -213,6 +258,11 @@ class Library extends Model {
       },
       lastScan: this.lastScan?.valueOf() || null,
       lastScanVersion: this.lastScanVersion,
+      storageType: this.storageType || 'local',
+      s3Bucket: this.s3Bucket || null,
+      s3Region: this.s3Region || null,
+      s3Endpoint: this.s3Endpoint || null,
+      s3KeyPrefix: this.s3KeyPrefix || null,
       createdAt: this.createdAt.valueOf(),
       lastUpdate: this.updatedAt.valueOf()
     }

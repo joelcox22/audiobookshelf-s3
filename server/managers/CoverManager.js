@@ -1,5 +1,6 @@
 const fs = require('../libs/fsExtra')
 const Path = require('path')
+const os = require('os')
 const Logger = require('../Logger')
 const readChunk = require('../libs/readChunk')
 const imageType = require('../libs/imageType')
@@ -8,6 +9,8 @@ const globals = require('../utils/globals')
 const { downloadImageFile, filePathToPOSIX, checkPathIsFile } = require('../utils/fileUtils')
 const { extractCoverArt } = require('../utils/ffmpegHelpers')
 const parseEbookMetadata = require('../utils/parsers/parseEbookMetadata')
+const { getLibraryS3Config } = require('../utils/storageUtils')
+const S3StorageManager = require('../managers/S3StorageManager')
 
 const CacheManager = require('../managers/CacheManager')
 
@@ -19,6 +22,23 @@ class CoverManager {
       return libraryItem.path
     } else {
       return Path.posix.join(Path.posix.join(global.MetadataPath, 'items'), libraryItem.id)
+    }
+  }
+
+  /**
+   * Build the S3 cover key for a library item.
+   * When storeCoverWithItem is true and the item is not a file, the cover goes in the item's
+   * own S3 prefix. Otherwise it goes under .abs/metadata/items/{id}/
+   * @param {import('../models/LibraryItem')} libraryItem
+   * @param {import('./S3StorageManager').S3LibraryClient} libraryClient
+   * @param {string} ext - file extension including dot, e.g. '.jpg'
+   * @returns {string} S3 key
+   */
+  getCoverS3Key(libraryItem, libraryClient, ext) {
+    if (global.ServerSettings.storeCoverWithItem && !libraryItem.isFile) {
+      return libraryClient.buildKey(`${libraryItem.relPath}/cover${ext}`)
+    } else {
+      return libraryClient.buildKey(`.abs/metadata/items/${libraryItem.id}/cover${ext}`)
     }
   }
 
@@ -60,6 +80,37 @@ class CoverManager {
     }
   }
 
+  /**
+   * Remove old S3 cover objects for a library item (covers with different extension).
+   * Lists all .abs/metadata/items/{id}/ objects and deletes those named "cover.*" but not newCoverExt.
+   * @param {import('./S3StorageManager').S3LibraryClient} libraryClient
+   * @param {string} libraryItemId
+   * @param {boolean} storeCoverWithItem
+   * @param {string} itemRelPath
+   * @param {string} newCoverExt - e.g. '.jpg'
+   */
+  async removeOldS3Covers(libraryClient, libraryItemId, storeCoverWithItem, itemRelPath, newCoverExt) {
+    const imageExtensions = ['.jpeg', '.jpg', '.png', '.webp', '.jiff']
+    const prefix = storeCoverWithItem && itemRelPath ? itemRelPath : `.abs/metadata/items/${libraryItemId}`
+    const objects = await libraryClient.listObjects(prefix).catch((err) => {
+      Logger.error(`[CoverManager] Failed to list S3 objects for cover cleanup`, err)
+      return []
+    })
+    const toDelete = objects
+      .filter((o) => {
+        const basename = Path.basename(o.key)
+        const ext = Path.extname(basename).toLowerCase()
+        const filename = Path.basename(basename, ext).toLowerCase()
+        return filename === 'cover' && ext !== newCoverExt && imageExtensions.includes(ext)
+      })
+      .map((o) => o.key)
+    if (toDelete.length) {
+      await libraryClient.deleteObjects(toDelete).catch((err) => {
+        Logger.error(`[CoverManager] Failed to delete old S3 cover objects`, err)
+      })
+    }
+  }
+
   async checkFileIsValidImage(imagepath, removeOnInvalid = false) {
     const buffer = await readChunk(imagepath, 0, 12)
     const imgType = imageType(buffer)
@@ -91,6 +142,23 @@ class CoverManager {
       return {
         error: `Invalid image type ${extname} (Supported: ${globals.SupportedImageTypes.join(',')})`
       }
+    }
+
+    // S3-backed library: upload directly to S3
+    const s3Config = getLibraryS3Config(libraryItem.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const coverKey = this.getCoverS3Key(libraryItem, libraryClient, extname)
+
+      const uploadStream = fs.createReadStream(coverFile.tempFilePath)
+      await libraryClient.putObject(coverKey, uploadStream, `image/${extname.slice(1)}`)
+      await fs.unlink(coverFile.tempFilePath).catch(() => {})
+
+      await this.removeOldS3Covers(libraryClient, libraryItem.id, global.ServerSettings.storeCoverWithItem && !libraryItem.isFile, libraryItem.relPath, extname)
+      await CacheManager.purgeCoverCache(libraryItem.id)
+
+      Logger.info(`[CoverManager] Uploaded libraryItem cover to S3 "${coverKey}" for "${libraryItem.media.title}"`)
+      return { cover: coverKey }
     }
 
     const coverDirPath = this.getCoverDirectory(libraryItem)
@@ -130,6 +198,15 @@ class CoverManager {
    * @returns {Promise<{error:string}|{cover:string,updated:boolean}>}
    */
   async validateCoverPath(coverPath, libraryItem) {
+    // S3-backed libraries do not support user-supplied local cover paths
+    const s3Config = getLibraryS3Config(libraryItem.libraryId)
+    if (s3Config) {
+      Logger.error(`[CoverManager] validateCoverPath is not supported for S3-backed libraries`)
+      return {
+        error: 'Local cover paths are not supported for S3-backed libraries. Please upload a cover image instead.'
+      }
+    }
+
     // Invalid cover path
     if (!coverPath || coverPath.startsWith('http:') || coverPath.startsWith('https:')) {
       Logger.error(`[CoverManager] validate cover path invalid http url "${coverPath}"`)
@@ -210,11 +287,43 @@ class CoverManager {
    * @param {import('../models/Book').AudioFileObject[]} audioFiles
    * @param {string} libraryItemId
    * @param {string} [libraryItemPath] null for isFile library items
-   * @returns {Promise<string>} returns cover path
+   * @param {string} [libraryId] needed for S3 lookup
+   * @returns {Promise<string>} returns cover path or S3 key
    */
-  async saveEmbeddedCoverArt(audioFiles, libraryItemId, libraryItemPath) {
+  async saveEmbeddedCoverArt(audioFiles, libraryItemId, libraryItemPath, libraryId) {
     let audioFileWithCover = audioFiles.find((af) => af.embeddedCoverArt)
     if (!audioFileWithCover) return null
+
+    // S3-backed library: extract to temp, upload to S3
+    const s3Config = libraryId ? getLibraryS3Config(libraryId) : null
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const ext = audioFileWithCover.embeddedCoverArt === 'png' ? '.png' : '.jpg'
+      const tempPath = Path.join(os.tmpdir(), `absembedcover_${libraryItemId}_${Date.now()}${ext}`)
+
+      // For S3, the audio file path is the S3 key — we need to get the actual audio from S3
+      // extractCoverArt calls ffmpeg which only works on local files; we skip if key-only
+      // Instead we just note that for S3 libraries embedded cover extraction is not available without temp download
+      // For now, skip if the audio file metadata.path is an S3 key (no leading /)
+      const audioPath = audioFileWithCover.metadata.path
+      if (!audioPath || !audioPath.startsWith('/')) {
+        Logger.warn(`[CoverManager] Skipping embedded cover extraction for S3-backed audio file (requires local file)`)
+        return null
+      }
+
+      const success = await extractCoverArt(audioPath, tempPath)
+      if (!success) return null
+
+      const coverKey = libraryItemPath
+        ? libraryClient.buildKey(`${libraryItemPath}/cover${ext}`)
+        : libraryClient.buildKey(`.abs/metadata/items/${libraryItemId}/cover${ext}`)
+
+      const readStream = fs.createReadStream(tempPath)
+      await libraryClient.putObject(coverKey, readStream, `image/${ext.slice(1)}`)
+      await fs.unlink(tempPath).catch(() => {})
+      await CacheManager.purgeCoverCache(libraryItemId)
+      return coverKey
+    }
 
     let coverDirPath = null
     if (global.ServerSettings.storeCoverWithItem && libraryItemPath) {
@@ -247,10 +356,34 @@ class CoverManager {
    * @param {import('../utils/parsers/parseEbookMetadata').EBookFileScanData} ebookFileScanData
    * @param {string} libraryItemId
    * @param {string} [libraryItemPath] null for isFile library items
-   * @returns {Promise<string>} returns cover path
+   * @param {string} [libraryId] needed for S3 lookup
+   * @returns {Promise<string>} returns cover path or S3 key
    */
-  async saveEbookCoverArt(ebookFileScanData, libraryItemId, libraryItemPath) {
+  async saveEbookCoverArt(ebookFileScanData, libraryItemId, libraryItemPath, libraryId) {
     if (!ebookFileScanData?.ebookCoverPath) return null
+
+    let extname = Path.extname(ebookFileScanData.ebookCoverPath) || '.jpg'
+    if (extname === '.jpeg') extname = '.jpg'
+
+    // S3-backed library: extract to temp, upload to S3
+    const s3Config = libraryId ? getLibraryS3Config(libraryId) : null
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const tempPath = Path.join(os.tmpdir(), `absebookcover_${libraryItemId}_${Date.now()}${extname}`)
+
+      const success = await parseEbookMetadata.extractCoverImage(ebookFileScanData, tempPath)
+      if (!success) return null
+
+      const coverKey = libraryItemPath
+        ? libraryClient.buildKey(`${libraryItemPath}/cover${extname}`)
+        : libraryClient.buildKey(`.abs/metadata/items/${libraryItemId}/cover${extname}`)
+
+      const readStream = fs.createReadStream(tempPath)
+      await libraryClient.putObject(coverKey, readStream, `image/${extname.slice(1)}`)
+      await fs.unlink(tempPath).catch(() => {})
+      await CacheManager.purgeCoverCache(libraryItemId)
+      return coverKey
+    }
 
     let coverDirPath = null
     if (global.ServerSettings.storeCoverWithItem && libraryItemPath) {
@@ -260,8 +393,6 @@ class CoverManager {
     }
     await fs.ensureDir(coverDirPath)
 
-    let extname = Path.extname(ebookFileScanData.ebookCoverPath) || '.jpg'
-    if (extname === '.jpeg') extname = '.jpg'
     const coverFilename = `cover${extname}`
     const coverFilePath = Path.join(coverDirPath, coverFilename)
 
@@ -285,10 +416,48 @@ class CoverManager {
    * @param {string} libraryItemId
    * @param {string} [libraryItemPath] - null if library item isFile
    * @param {boolean} [forceLibraryItemFolder=false] - force save cover with library item (used for adding new podcasts)
+   * @param {string} [libraryId] - needed for S3 lookup
    * @returns {Promise<{error:string}|{cover:string}>}
    */
-  async downloadCoverFromUrlNew(url, libraryItemId, libraryItemPath, forceLibraryItemFolder = false) {
+  async downloadCoverFromUrlNew(url, libraryItemId, libraryItemPath, forceLibraryItemFolder = false, libraryId) {
     try {
+      // S3-backed library: download to temp dir, validate, upload to S3
+      const s3Config = libraryId ? getLibraryS3Config(libraryId) : null
+      if (s3Config) {
+        const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+        const temppath = Path.join(os.tmpdir(), `abscover_${libraryItemId}_${Date.now()}`)
+        const success = await downloadImageFile(url, temppath)
+          .then(() => true)
+          .catch((err) => {
+            Logger.error(`[CoverManager] Download image file failed for "${url}"`, err)
+            return false
+          })
+        if (!success) {
+          return { error: 'Failed to download image from url' }
+        }
+
+        const imgtype = await this.checkFileIsValidImage(temppath, true)
+        if (imgtype.error) {
+          return imgtype
+        }
+
+        const ext = `.${imgtype.ext}`
+        const coverKey =
+          (global.ServerSettings.storeCoverWithItem || forceLibraryItemFolder) && libraryItemPath
+            ? libraryClient.buildKey(`${libraryItemPath}/cover${ext}`)
+            : libraryClient.buildKey(`.abs/metadata/items/${libraryItemId}/cover${ext}`)
+
+        const readStream = fs.createReadStream(temppath)
+        await libraryClient.putObject(coverKey, readStream, `image/${imgtype.ext}`)
+        await fs.unlink(temppath).catch(() => {})
+
+        await this.removeOldS3Covers(libraryClient, libraryItemId, (global.ServerSettings.storeCoverWithItem || forceLibraryItemFolder) && !!libraryItemPath, libraryItemPath, ext)
+        await CacheManager.purgeCoverCache(libraryItemId)
+
+        Logger.info(`[CoverManager] Downloaded libraryItem cover to S3 "${coverKey}" from url "${url}"`)
+        return { cover: coverKey }
+      }
+
       let coverDirPath = null
       if ((global.ServerSettings.storeCoverWithItem || forceLibraryItemFolder) && libraryItemPath) {
         coverDirPath = libraryItemPath

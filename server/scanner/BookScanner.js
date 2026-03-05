@@ -353,13 +353,13 @@ class BookScanner {
     // If no cover then extract cover from audio file OR from ebook
     const libraryItemDir = existingLibraryItem.isFile ? null : existingLibraryItem.path
     if (!media.coverPath) {
-      let extractedCoverPath = await CoverManager.saveEmbeddedCoverArt(media.audioFiles, existingLibraryItem.id, libraryItemDir)
+      let extractedCoverPath = await CoverManager.saveEmbeddedCoverArt(media.audioFiles, existingLibraryItem.id, libraryItemDir, existingLibraryItem.libraryId)
       if (extractedCoverPath) {
         libraryScan.addLog(LogLevel.DEBUG, `Updating book "${bookMetadata.title}" extracted embedded cover art from audio file to path "${extractedCoverPath}"`)
         media.coverPath = extractedCoverPath
         hasMediaChanges = true
       } else if (ebookFileScanData?.ebookCoverPath) {
-        extractedCoverPath = await CoverManager.saveEbookCoverArt(ebookFileScanData, existingLibraryItem.id, libraryItemDir)
+        extractedCoverPath = await CoverManager.saveEbookCoverArt(ebookFileScanData, existingLibraryItem.id, libraryItemDir, existingLibraryItem.libraryId)
         if (extractedCoverPath) {
           libraryScan.addLog(LogLevel.DEBUG, `Updating book "${bookMetadata.title}" extracted embedded cover art from ebook file to path "${extractedCoverPath}"`)
           media.coverPath = extractedCoverPath
@@ -374,7 +374,7 @@ class BookScanner {
         .map((au) => au.name)
         .filter((au) => au)
         .join(', ')
-      const coverPath = await this.searchForCover(existingLibraryItem.id, libraryItemDir, media.title, authorName, libraryScan)
+      const coverPath = await this.searchForCover(existingLibraryItem.id, libraryItemDir, media.title, authorName, libraryScan, existingLibraryItem.libraryId)
       if (coverPath) {
         media.coverPath = coverPath
         hasMediaChanges = true
@@ -540,12 +540,12 @@ class BookScanner {
     // If cover was not found in folder then check embedded covers in audio files OR ebook file
     const libraryItemDir = libraryItemObj.isFile ? null : libraryItemObj.path
     if (!bookObject.coverPath) {
-      let extractedCoverPath = await CoverManager.saveEmbeddedCoverArt(scannedAudioFiles, libraryItemObj.id, libraryItemDir)
+      let extractedCoverPath = await CoverManager.saveEmbeddedCoverArt(scannedAudioFiles, libraryItemObj.id, libraryItemDir, libraryItemData.libraryId)
       if (extractedCoverPath) {
         libraryScan.addLog(LogLevel.DEBUG, `Extracted embedded cover from audio file at "${extractedCoverPath}" for book "${bookObject.title}"`)
         bookObject.coverPath = extractedCoverPath
       } else if (ebookFileScanData?.ebookCoverPath) {
-        extractedCoverPath = await CoverManager.saveEbookCoverArt(ebookFileScanData, libraryItemObj.id, libraryItemDir)
+        extractedCoverPath = await CoverManager.saveEbookCoverArt(ebookFileScanData, libraryItemObj.id, libraryItemDir, libraryItemData.libraryId)
         if (extractedCoverPath) {
           libraryScan.addLog(LogLevel.DEBUG, `Extracted embedded cover from ebook file at "${extractedCoverPath}" for book "${bookObject.title}"`)
           bookObject.coverPath = extractedCoverPath
@@ -556,7 +556,7 @@ class BookScanner {
     // If cover not found then search for cover if enabled in settings
     if (!bookObject.coverPath && Database.serverSettings.scannerFindCovers) {
       const authorName = bookMetadata.authors.join(', ')
-      bookObject.coverPath = await this.searchForCover(libraryItemObj.id, libraryItemDir, bookObject.title, authorName, libraryScan)
+      bookObject.coverPath = await this.searchForCover(libraryItemObj.id, libraryItemDir, bookObject.title, authorName, libraryScan, libraryItemData.libraryId)
     }
 
     libraryItemObj.book = bookObject
@@ -972,7 +972,7 @@ class BookScanner {
    * @param {LibraryScan} libraryScan
    * @returns {Promise<string>} path to downloaded cover or null if no cover found
    */
-  async searchForCover(libraryItemId, libraryItemPath, title, author, libraryScan) {
+  async searchForCover(libraryItemId, libraryItemPath, title, author, libraryScan, libraryId) {
     const options = {
       titleDistance: 2,
       authorDistance: 2
@@ -984,7 +984,7 @@ class BookScanner {
       // If the first cover result fails, attempt to download the second
       for (let i = 0; i < results.length && i < 2; i++) {
         // Downloads and updates the book cover
-        const result = await CoverManager.downloadCoverFromUrlNew(results[i], libraryItemId, libraryItemPath)
+        const result = await CoverManager.downloadCoverFromUrlNew(results[i], libraryItemId, libraryItemPath, false, libraryId)
 
         if (result.error) {
           libraryScan.addLog(LogLevel.ERROR, `Failed to download cover from url "${results[i]}" | Attempt ${i + 1}`, result.error)

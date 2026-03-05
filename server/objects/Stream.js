@@ -9,6 +9,8 @@ const Ffmpeg = require('../libs/fluentFfmpeg')
 const { secondsToTimestamp } = require('../utils/index')
 const { writeConcatFile } = require('../utils/ffmpegHelpers')
 const { AudioMimeType } = require('../utils/constants')
+const { getLibraryS3Config } = require('../utils/storageUtils')
+const S3StorageManager = require('../managers/S3StorageManager')
 const hlsPlaylistGenerator = require('../utils/generators/hlsPlaylistGenerator')
 const AudioTrack = require('./files/AudioTrack')
 
@@ -239,7 +241,28 @@ class Stream extends EventEmitter {
     this.furthestSegmentCreated = 0
 
     const adjustedStartTime = Math.max(this.startTime - this.maxSeekBackTime, 0)
-    const trackStartTime = await writeConcatFile(this.tracks, this.concatFilesPath, adjustedStartTime)
+
+    // For S3-backed libraries, replace track paths with presigned URLs before writing the concat file
+    let tracks = this.tracks
+    const s3Config = getLibraryS3Config(this.libraryItem.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const ttl = S3StorageManager.presignedUrlTtlSeconds
+      tracks = await Promise.all(
+        this.tracks.map(async (track) => {
+          const key = libraryClient.buildKey(track.metadata.relPath)
+          const url = await libraryClient.getPresignedGetUrl(key, ttl)
+          // Return a shallow clone with the presigned URL as the path
+          return {
+            ...track,
+            metadata: { ...track.metadata, path: url }
+          }
+        })
+      )
+      Logger.debug(`[Stream] Using presigned S3 URLs for ${tracks.length} audio tracks`)
+    }
+
+    const trackStartTime = await writeConcatFile(tracks, this.concatFilesPath, adjustedStartTime)
     if (trackStartTime == null) {
       // Close stream show error
       this.ffmpeg = null

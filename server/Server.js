@@ -14,6 +14,7 @@ const { version } = require('../package.json')
 const is = require('./libs/requestIp/isJs')
 const fileUtils = require('./utils/fileUtils')
 const { toNumber } = require('./utils/index')
+const { refreshLibraryCache } = require('./utils/storageUtils')
 const Logger = require('./Logger')
 
 const Auth = require('./Auth')
@@ -170,6 +171,10 @@ class Server {
     await RssFeedManager.init()
 
     const libraries = await Database.libraryModel.getAllWithFolders()
+    // Populate in-memory storage config cache for all libraries
+    for (const library of libraries) {
+      refreshLibraryCache(library)
+    }
     await this.cronManager.init(libraries)
     this.apiCacheManager.init()
 

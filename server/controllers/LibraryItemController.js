@@ -10,6 +10,8 @@ const zipHelpers = require('../utils/zipHelpers')
 const { reqSupportsWebp } = require('../utils/index')
 const { ScanResult, AudioMimeType } = require('../utils/constants')
 const { getAudioMimeTypeFromExtname, encodeUriPath } = require('../utils/fileUtils')
+const { getLibraryS3Config } = require('../utils/storageUtils')
+const S3StorageManager = require('../managers/S3StorageManager')
 const LibraryItemScanner = require('../scanner/LibraryItemScanner')
 const AudioFileScanner = require('../scanner/AudioFileScanner')
 const Scanner = require('../scanner/Scanner')
@@ -114,9 +116,26 @@ class LibraryItemController {
     await this.handleDeleteLibraryItem(req.libraryItem.id, mediaItemIds)
     if (hardDelete) {
       Logger.info(`[LibraryItemController] Deleting library item from file system at "${libraryItemPath}"`)
-      await fs.remove(libraryItemPath).catch((error) => {
-        Logger.error(`[LibraryItemController] Failed to delete library item from file system at "${libraryItemPath}"`, error)
-      })
+
+      // S3-backed library: delete all objects under the item's prefix
+      const s3Config = getLibraryS3Config(req.libraryItem.libraryId)
+      if (s3Config) {
+        const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+        const itemRelPath = req.libraryItem.relPath
+        const objects = await libraryClient.listObjects(itemRelPath).catch((error) => {
+          Logger.error(`[LibraryItemController] Failed to list S3 objects for item "${itemRelPath}"`, error)
+          return []
+        })
+        if (objects.length) {
+          await libraryClient.deleteObjects(objects.map((o) => o.key)).catch((error) => {
+            Logger.error(`[LibraryItemController] Failed to delete S3 objects for item "${itemRelPath}"`, error)
+          })
+        }
+      } else {
+        await fs.remove(libraryItemPath).catch((error) => {
+          Logger.error(`[LibraryItemController] Failed to delete library item from file system at "${libraryItemPath}"`, error)
+        })
+      }
     }
 
     if (authorIds.length) {
@@ -156,6 +175,43 @@ class LibraryItemController {
     const itemTitle = req.libraryItem.media.title
 
     Logger.info(`[LibraryItemController] User "${req.user.username}" requested download for item "${itemTitle}" at "${libraryItemPath}"`)
+
+    // S3-backed library: redirect single-file items; zip multi-file items by streaming from S3
+    const s3Config = getLibraryS3Config(req.libraryItem.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      if (req.libraryItem.isFile) {
+        // Single file: redirect to a presigned URL
+        const primaryFile = req.libraryItem.libraryFiles?.[0]
+        if (!primaryFile) {
+          return res.status(404).send('File not found')
+        }
+        const key = libraryClient.buildKey(primaryFile.metadata.relPath)
+        const url = await libraryClient.getPresignedGetUrl(key, S3StorageManager.presignedUrlTtlSeconds)
+        Logger.debug(`[LibraryItemController] S3 redirect for item download "${itemTitle}"`)
+        return res.redirect(url)
+      } else {
+        // Multi-file: stream each object from S3 into a zip
+        try {
+          const objects = await libraryClient.listObjects(req.libraryItem.relPath)
+          const filename = `${itemTitle}.zip`
+          const s3StreamEntries = []
+          for (const obj of objects) {
+            const relPath = libraryClient.keyToRelPath(obj.key)
+            s3StreamEntries.push({
+              name: relPath,
+              stream: await libraryClient.getObjectStream(obj.key)
+            })
+          }
+          await zipHelpers.zipStreamEntries(s3StreamEntries, filename, res)
+          Logger.info(`[LibraryItemController] Downloaded S3 item "${itemTitle}"`)
+        } catch (error) {
+          Logger.error(`[LibraryItemController] S3 download failed for item "${itemTitle}"`, error)
+          if (!res.headersSent) res.status(500).send('Download failed')
+        }
+        return
+      }
+    }
 
     try {
       // If library item is a single file in root dir then no need to zip
@@ -384,7 +440,23 @@ class LibraryItemController {
 
     if (raw) {
       const coverPath = await Database.libraryItemModel.getCoverPath(libraryItemId)
-      if (!coverPath || !(await fs.pathExists(coverPath))) {
+      if (!coverPath) {
+        return res.sendStatus(404)
+      }
+
+      // S3-backed library: redirect client directly to S3 via presigned URL
+      const { isS3Key } = require('../utils/storageUtils')
+      if (isS3Key(coverPath)) {
+        const s3Config = getLibraryS3Config(req.libraryItem?.libraryId)
+        if (s3Config) {
+          const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+          const url = await libraryClient.getPresignedGetUrl(coverPath, S3StorageManager.presignedUrlTtlSeconds)
+          Logger.debug(`[LibraryItemController] S3 redirect for raw cover of item ${libraryItemId}`)
+          return res.redirect(url)
+        }
+      }
+
+      if (!(await fs.pathExists(coverPath))) {
         return res.sendStatus(404)
       }
       // any value
@@ -941,6 +1013,16 @@ class LibraryItemController {
       return res.status(204).header({ 'X-Accel-Redirect': encodedURI }).send()
     }
 
+    // S3-backed library: redirect client directly to S3 via presigned URL
+    const s3Config = getLibraryS3Config(req.libraryItem?.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const key = libraryClient.buildKey(libraryFile.metadata.relPath)
+      const url = await libraryClient.getPresignedGetUrl(key, S3StorageManager.presignedUrlTtlSeconds)
+      Logger.debug(`[LibraryItemController] S3 redirect for library file ${libraryFile.metadata.filename}`)
+      return res.redirect(url)
+    }
+
     // Express does not set the correct mimetype for m4b files so use our defined mimetypes if available
     const audioMimeType = getAudioMimeTypeFromExtname(Path.extname(libraryFile.metadata.path))
     if (audioMimeType) {
@@ -960,9 +1042,19 @@ class LibraryItemController {
 
     Logger.info(`[LibraryItemController] User "${req.user.username}" requested file delete at "${libraryFile.metadata.path}"`)
 
-    await fs.remove(libraryFile.metadata.path).catch((error) => {
-      Logger.error(`[LibraryItemController] Failed to delete library file at "${libraryFile.metadata.path}"`, error)
-    })
+    // S3-backed library: delete the object from S3
+    const s3Config = getLibraryS3Config(req.libraryItem?.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const key = libraryClient.buildKey(libraryFile.metadata.relPath)
+      await libraryClient.deleteObject(key).catch((error) => {
+        Logger.error(`[LibraryItemController] Failed to delete S3 object "${key}"`, error)
+      })
+    } else {
+      await fs.remove(libraryFile.metadata.path).catch((error) => {
+        Logger.error(`[LibraryItemController] Failed to delete library file at "${libraryFile.metadata.path}"`, error)
+      })
+    }
 
     req.libraryItem.libraryFiles = req.libraryItem.libraryFiles.filter((lf) => lf.ino !== req.params.fileid)
     req.libraryItem.changed('libraryFiles', true)
@@ -1033,6 +1125,16 @@ class LibraryItemController {
       return res.status(204).header({ 'X-Accel-Redirect': encodedURI }).send()
     }
 
+    // S3-backed library: redirect client directly to S3 via presigned URL
+    const s3Config = getLibraryS3Config(req.libraryItem?.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const key = libraryClient.buildKey(libraryFile.metadata.relPath)
+      const url = await libraryClient.getPresignedGetUrl(key, S3StorageManager.presignedUrlTtlSeconds)
+      Logger.debug(`[LibraryItemController] S3 redirect for file download ${libraryFile.metadata.filename}`)
+      return res.redirect(url)
+    }
+
     // Express does not set the correct mimetype for m4b files so use our defined mimetypes if available
     let audioMimeType = getAudioMimeTypeFromExtname(Path.extname(libraryFile.metadata.path))
     if (audioMimeType) {
@@ -1088,6 +1190,16 @@ class LibraryItemController {
       const encodedURI = encodeUriPath(global.XAccel + ebookFilePath)
       Logger.debug(`Use X-Accel to serve static file ${encodedURI}`)
       return res.status(204).header({ 'X-Accel-Redirect': encodedURI }).send()
+    }
+
+    // S3-backed library: redirect client directly to S3 via presigned URL
+    const s3Config = getLibraryS3Config(req.libraryItem?.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const key = libraryClient.buildKey(ebookFile.metadata.relPath)
+      const url = await libraryClient.getPresignedGetUrl(key, S3StorageManager.presignedUrlTtlSeconds)
+      Logger.debug(`[LibraryItemController] S3 redirect for ebook file ${ebookFile.metadata.filename}`)
+      return res.redirect(url)
     }
 
     try {

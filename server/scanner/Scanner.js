@@ -63,7 +63,7 @@ class Scanner {
       // Update cover if not set OR overrideCover flag
       if (matchData.cover && (!libraryItem.media.coverPath || options.overrideCover)) {
         Logger.debug(`[Scanner] Updating cover "${matchData.cover}"`)
-        const coverResult = await CoverManager.downloadCoverFromUrlNew(matchData.cover, libraryItem.id, libraryItem.isFile ? null : libraryItem.path)
+        const coverResult = await CoverManager.downloadCoverFromUrlNew(matchData.cover, libraryItem.id, libraryItem.isFile ? null : libraryItem.path, false, libraryItem.libraryId)
         if (coverResult.error) {
           Logger.warn(`[Scanner] Match cover "${matchData.cover}" failed to use: ${coverResult.error}`)
         } else {
@@ -91,7 +91,7 @@ class Scanner {
       // Update cover if not set OR overrideCover flag
       if (matchData.cover && (!libraryItem.media.coverPath || options.overrideCover)) {
         Logger.debug(`[Scanner] Updating cover "${matchData.cover}"`)
-        const coverResult = await CoverManager.downloadCoverFromUrlNew(matchData.cover, libraryItem.id, libraryItem.path)
+        const coverResult = await CoverManager.downloadCoverFromUrlNew(matchData.cover, libraryItem.id, libraryItem.path, false, libraryItem.libraryId)
         if (coverResult.error) {
           Logger.warn(`[Scanner] Match cover "${matchData.cover}" failed to use: ${coverResult.error}`)
         } else {

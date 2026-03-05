@@ -1,9 +1,12 @@
 const Path = require('path')
+const os = require('os')
 const fs = require('../libs/fsExtra')
 const stream = require('stream')
 const Logger = require('../Logger')
 const { resizeImage } = require('../utils/ffmpegHelpers')
 const { encodeUriPath } = require('../utils/fileUtils')
+const { getLibraryS3Config, isS3Key } = require('../utils/storageUtils')
+const S3StorageManager = require('./S3StorageManager')
 const Database = require('../Database')
 
 class CacheManager {
@@ -42,6 +45,18 @@ class CacheManager {
 
     res.type(`image/${format}`)
 
+    // Retrieve the cover path from DB to determine if it's an S3 key
+    const coverPath = await Database.libraryItemModel.getCoverPath(libraryItemId)
+
+    if (coverPath && isS3Key(coverPath)) {
+      // S3-backed library: resize cache lives in S3 under __resize_cache__/
+      const s3Config = await this._getS3ConfigForLibraryItem(libraryItemId)
+      if (s3Config) {
+        return this._handleS3CoverCache(res, libraryItemId, coverPath, s3Config, width, height, format)
+      }
+    }
+
+    // ---- Local cache logic (unchanged) ----
     const cachePath = Path.join(this.CoverCachePath, `${libraryItemId}_${width}${height ? `x${height}` : ''}`) + '.' + format
 
     // Cache exists
@@ -64,7 +79,6 @@ class CacheManager {
     }
 
     // Cached cover does not exist, generate it
-    const coverPath = await Database.libraryItemModel.getCoverPath(libraryItemId)
     if (!coverPath || !(await fs.pathExists(coverPath))) {
       return res.sendStatus(404)
     }
@@ -82,7 +96,101 @@ class CacheManager {
     readStream.pipe(res)
   }
 
-  purgeCoverCache(libraryItemId) {
+  /**
+   * Handle cover cache for an S3-backed library item.
+   * Cache is stored in S3 under __resize_cache__/covers/
+   *
+   * @private
+   */
+  async _handleS3CoverCache(res, libraryItemId, coverKey, s3Config, width, height, format) {
+    const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+    const cacheRelKey = `__resize_cache__/covers/${libraryItemId}_${width}${height ? `x${height}` : ''}.${format}`
+    const cacheKey = libraryClient.buildKey(cacheRelKey)
+
+    // Check if cache already exists in S3
+    const cacheExists = await libraryClient.headObject(cacheKey).catch(() => null)
+    if (cacheExists) {
+      const url = await libraryClient.getPresignedGetUrl(cacheKey, S3StorageManager.presignedUrlTtlSeconds)
+      Logger.debug(`[CacheManager] S3 cache hit for cover ${libraryItemId}`)
+      return res.redirect(url)
+    }
+
+    // Cache miss: stream source cover from S3 to a temp file, resize it, upload to S3 cache
+    const tempSuffix = `abscover_${libraryItemId}_${Date.now()}`
+    const tempSourcePath = Path.join(os.tmpdir(), `${tempSuffix}_src`)
+    const tempResizedPath = Path.join(os.tmpdir(), `${tempSuffix}_resized.${format}`)
+
+    try {
+      // Download source cover to temp file
+      const sourceStream = await libraryClient.getObjectStream(coverKey)
+      await new Promise((resolve, reject) => {
+        const writeStream = fs.createWriteStream(tempSourcePath)
+        sourceStream.pipe(writeStream)
+        writeStream.on('finish', resolve)
+        writeStream.on('error', reject)
+        sourceStream.on('error', reject)
+      })
+
+      // Resize
+      const writtenFile = await resizeImage(tempSourcePath, tempResizedPath, width, height)
+      if (!writtenFile) {
+        return res.sendStatus(500)
+      }
+
+      // Upload resized image to S3 cache
+      const readStream = fs.createReadStream(tempResizedPath)
+      await libraryClient.putObject(cacheKey, readStream, `image/${format}`)
+
+      // Redirect to the newly cached presigned URL
+      const url = await libraryClient.getPresignedGetUrl(cacheKey, S3StorageManager.presignedUrlTtlSeconds)
+      Logger.debug(`[CacheManager] S3 cache miss — resized and uploaded cover ${libraryItemId}`)
+      return res.redirect(url)
+    } catch (error) {
+      Logger.error(`[CacheManager] Failed to handle S3 cover cache for ${libraryItemId}`, error)
+      return res.sendStatus(500)
+    } finally {
+      // Clean up temp files
+      fs.unlink(tempSourcePath).catch(() => {})
+      fs.unlink(tempResizedPath).catch(() => {})
+    }
+  }
+
+  /**
+   * Resolve S3 config for a library item by looking up its library.
+   * @private
+   * @param {string} libraryItemId
+   * @returns {Promise<{bucket:string,keyPrefix:string,region?:string,endpoint?:string}|null>}
+   */
+  async _getS3ConfigForLibraryItem(libraryItemId) {
+    const libraryItem = await Database.libraryItemModel.findByPk(libraryItemId, {
+      attributes: ['id', 'libraryId']
+    })
+    if (!libraryItem) return null
+    return getLibraryS3Config(libraryItem.libraryId)
+  }
+
+  /**
+   * Purge cover cache for a single library item.
+   * For S3-backed libraries, deletes the resize cache objects from S3.
+   * @param {string} libraryItemId
+   */
+  async purgeCoverCache(libraryItemId) {
+    // Try to purge from S3 if this is an S3-backed item
+    const s3Config = await this._getS3ConfigForLibraryItem(libraryItemId).catch(() => null)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const cachePrefix = `__resize_cache__/covers/${libraryItemId}_`
+      const objects = await libraryClient.listObjects(cachePrefix).catch((err) => {
+        Logger.error(`[CacheManager] Failed to list S3 cache objects for ${libraryItemId}`, err)
+        return []
+      })
+      if (objects.length) {
+        await libraryClient.deleteObjects(objects.map((o) => o.key)).catch((err) => {
+          Logger.error(`[CacheManager] Failed to delete S3 cache objects for ${libraryItemId}`, err)
+        })
+      }
+    }
+    // Also purge local cache (no-op if no local cache files exist)
     return this.purgeEntityCache(libraryItemId, this.CoverCachePath)
   }
 
