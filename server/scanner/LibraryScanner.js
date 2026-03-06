@@ -423,9 +423,12 @@ class LibraryScanner {
     // Convert S3 objects to a file-items array that scandir can group
     const fileItems = filtered.map((obj) => {
       const relPath = libraryClient.keyToRelPath(obj.key)
+      const dirname = Path.posix.dirname(relPath)
       return {
+        name: Path.posix.basename(relPath),
         fullpath: obj.key,
         path: relPath,
+        reldirpath: dirname === '.' ? '' : dirname,
         extension: Path.extname(obj.key).toLowerCase(),
         deep: relPath.split('/').length - 1,
         size: obj.size,

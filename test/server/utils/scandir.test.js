@@ -49,4 +49,38 @@ describe('scanUtils', async () => {
       'Author/Series2/Book5/deeply/nested': ['cd 01/audiofile.mp3', 'cd 02/audiofile.mp3']
     })
   })
+
+  it('should properly group S3 file items that include name and reldirpath derived from key', async () => {
+    global.isWin = process.platform === 'win32'
+    global.ServerSettings = {
+      scannerParseSubtitle: false
+    }
+
+    // Simulate the S3 object keys as stored in the bucket (relative to prefix)
+    const s3RelPaths = [
+      'Author1/Book1/chapter1.mp3',
+      'Author1/Book1/chapter2.mp3',
+      'Author2/Book2/audiofile.m4b'
+    ]
+
+    // Build file items the same way scanS3Library does after the fix
+    const fileItems = s3RelPaths.map((relPath) => {
+      const dirname = Path.posix.dirname(relPath)
+      return {
+        name: Path.posix.basename(relPath),
+        fullpath: `bucket-name/${relPath}`,
+        path: relPath,
+        reldirpath: dirname === '.' ? '' : dirname,
+        extension: Path.posix.extname(relPath).toLowerCase(),
+        deep: relPath.split('/').length - 1
+      }
+    })
+
+    const libraryItemGrouping = scanUtils.groupFileItemsIntoLibraryItemDirs('book', fileItems, false)
+
+    expect(libraryItemGrouping).to.deep.equal({
+      'Author1/Book1': ['chapter1.mp3', 'chapter2.mp3'],
+      'Author2/Book2': ['audiofile.m4b']
+    })
+  })
 })
