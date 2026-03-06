@@ -429,7 +429,7 @@ class LibraryScanner {
         fullpath: obj.key,
         path: relPath,
         reldirpath: dirname === '.' ? '' : dirname,
-        extension: Path.extname(obj.key).toLowerCase(),
+        extension: Path.posix.extname(relPath).toLowerCase(),
         deep: relPath.split('/').length - 1,
         size: obj.size,
         mtimeMs: obj.lastModified?.getTime() ?? 0
