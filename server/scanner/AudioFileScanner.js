@@ -154,7 +154,10 @@ class AudioFileScanner {
    * @returns {Promise<AudioFile>}
    */
   async scan(mediaType, libraryFile, mediaMetadataFromScan) {
-    const probeData = await prober.probe(libraryFile.metadata.path)
+    // For S3 libraries, probeUrl is a presigned HTTP URL that ffprobe can fetch directly.
+    // For local libraries, fall back to the local filesystem path.
+    const probePath = libraryFile.probeUrl || libraryFile.metadata.path
+    const probeData = await prober.probe(probePath)
 
     if (probeData.error) {
       Logger.error(`[AudioFileScanner] ${probeData.error} : "${libraryFile.metadata.path}"`)

@@ -7,6 +7,7 @@ const Database = require('../Database')
 const fs = require('../libs/fsExtra')
 const fileUtils = require('../utils/fileUtils')
 const scanUtils = require('../utils/scandir')
+const globals = require('../utils/globals')
 const { LogLevel, ScanResult } = require('../utils/constants')
 const libraryFilters = require('../utils/queries/libraryFilters')
 const TaskManager = require('../managers/TaskManager')
@@ -467,24 +468,42 @@ class LibraryScanner {
       }
 
       // Build LibraryFile objects from the S3 file items
-      const libraryFiles = files.map((relFilePath) => {
-        const fileItem = fileItems.find((fi) => fi.path === relFilePath || fi.path === Path.posix.join(libraryItemRelPath, relFilePath))
-        const fullKey = fileItem?.fullpath || libraryClient.buildKey(relFilePath)
-        const fileRelPath = isFile ? relFilePath : Path.posix.join(libraryItemRelPath, relFilePath)
-        return {
-          ino: fullKey,
-          metadata: {
-            filename: Path.basename(relFilePath),
-            ext: Path.extname(relFilePath),
-            path: fullKey,
-            relPath: fileRelPath,
-            size: fileItem?.size || 0
-          },
-          addedAt: fileItem?.mtimeMs || Date.now(),
-          updatedAt: fileItem?.mtimeMs || Date.now(),
-          isSupplementary: null
-        }
-      })
+      const libraryFiles = await Promise.all(
+        files.map(async (relFilePath) => {
+          const fileItem = fileItems.find((fi) => fi.path === relFilePath || fi.path === Path.posix.join(libraryItemRelPath, relFilePath))
+          const fullKey = fileItem?.fullpath || libraryClient.buildKey(relFilePath)
+          const fileRelPath = isFile ? relFilePath : Path.posix.join(libraryItemRelPath, relFilePath)
+          const ext = Path.posix.extname(relFilePath)
+          const extclean = ext.slice(1).toLowerCase()
+          const isAudio = globals.SupportedAudioTypes.includes(extclean)
+
+          // Generate a presigned URL so AudioFileScanner can probe the file via HTTP
+          // instead of trying to read it as a local filesystem path
+          let probeUrl = null
+          if (isAudio) {
+            try {
+              probeUrl = await libraryClient.getPresignedGetUrl(fullKey)
+            } catch (err) {
+              Logger.warn(`[LibraryScanner] Failed to generate presigned URL for "${fullKey}": ${err.message}`)
+            }
+          }
+
+          return {
+            ino: fullKey,
+            probeUrl,
+            metadata: {
+              filename: Path.posix.basename(relFilePath),
+              ext,
+              path: fullKey,
+              relPath: fileRelPath,
+              size: fileItem?.size || 0
+            },
+            addedAt: fileItem?.mtimeMs || Date.now(),
+            updatedAt: fileItem?.mtimeMs || Date.now(),
+            isSupplementary: null
+          }
+        })
+      )
 
       // Use the last modified time of any file in the item as the item's mtime
       const mtimeMs = Math.max(...libraryFiles.map((lf) => lf.addedAt || 0))
