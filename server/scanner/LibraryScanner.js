@@ -444,9 +444,9 @@ class LibraryScanner {
       return []
     }
 
-    // Use the first library folder as the folder reference (required by LibraryItemScanData)
-    // S3 libraries may have no folders; we use a synthetic folder reference with just the library id
-    const folderId = library.libraryFolders?.[0]?.id || library.id
+    // S3 libraries don't have local library folders. Use the first folder id if one exists
+    // (unlikely), otherwise null. The libraryFolderId column is nullable (onDelete: SET NULL).
+    const folderId = library.libraryFolders?.[0]?.id || null
 
     const items = []
     for (const libraryItemRelPath in libraryItemGrouping) {
