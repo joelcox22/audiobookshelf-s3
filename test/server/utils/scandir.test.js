@@ -83,4 +83,80 @@ describe('scanUtils', async () => {
       'Author2/Book2': ['audiofile.m4b']
     })
   })
+
+  describe('expandS3FlatGroups', () => {
+    it('should split a flat directory with multiple audio files into individual items', () => {
+      const grouping = {
+        audiobooks: ['Book1.m4b', 'Book2.m4b', 'Book3.m4b']
+      }
+      const result = scanUtils.expandS3FlatGroups(grouping, 'book', false)
+      expect(result).to.deep.equal({
+        'audiobooks/Book1.m4b': 'audiobooks/Book1.m4b',
+        'audiobooks/Book2.m4b': 'audiobooks/Book2.m4b',
+        'audiobooks/Book3.m4b': 'audiobooks/Book3.m4b'
+      })
+    })
+
+    it('should leave a directory with a single audio file unchanged', () => {
+      const grouping = {
+        'Author/Book1': ['audiofile.m4b']
+      }
+      const result = scanUtils.expandS3FlatGroups(grouping, 'book', false)
+      expect(result).to.deep.equal({
+        'Author/Book1': ['audiofile.m4b']
+      })
+    })
+
+    it('should leave a multi-part book (with CD sub-directories) unchanged', () => {
+      const grouping = {
+        'Author/Book1': ['CD 1/part1.mp3', 'CD 2/part2.mp3']
+      }
+      const result = scanUtils.expandS3FlatGroups(grouping, 'book', false)
+      expect(result).to.deep.equal({
+        'Author/Book1': ['CD 1/part1.mp3', 'CD 2/part2.mp3']
+      })
+    })
+
+    it('should leave existing root-level single-file items (string values) unchanged', () => {
+      const grouping = {
+        'Book1.m4b': 'Book1.m4b',
+        'Book2.m4b': 'Book2.m4b'
+      }
+      const result = scanUtils.expandS3FlatGroups(grouping, 'book', false)
+      expect(result).to.deep.equal({
+        'Book1.m4b': 'Book1.m4b',
+        'Book2.m4b': 'Book2.m4b'
+      })
+    })
+
+    it('should split mixed flat directory (audio + cover) and drop non-media files', () => {
+      const grouping = {
+        audiobooks: ['Book1.m4b', 'Book2.m4b', 'cover.jpg']
+      }
+      const result = scanUtils.expandS3FlatGroups(grouping, 'book', false)
+      expect(result).to.deep.equal({
+        'audiobooks/Book1.m4b': 'audiobooks/Book1.m4b',
+        'audiobooks/Book2.m4b': 'audiobooks/Book2.m4b'
+      })
+    })
+
+    it('should handle multiple directories independently', () => {
+      const grouping = {
+        // flat genre dir — should be split
+        audiobooks: ['Book1.m4b', 'Book2.m4b'],
+        // per-book dir with multiple direct audio files — also split (use CD sub-dirs to keep together)
+        'Author/Book3': ['chapter1.mp3', 'chapter2.mp3'],
+        // single-file dir — should NOT be split
+        'Author/Book4': ['Book4.m4b']
+      }
+      const result = scanUtils.expandS3FlatGroups(grouping, 'book', false)
+      expect(result).to.deep.equal({
+        'audiobooks/Book1.m4b': 'audiobooks/Book1.m4b',
+        'audiobooks/Book2.m4b': 'audiobooks/Book2.m4b',
+        'Author/Book3/chapter1.mp3': 'Author/Book3/chapter1.mp3',
+        'Author/Book3/chapter2.mp3': 'Author/Book3/chapter2.mp3',
+        'Author/Book4': ['Book4.m4b']
+      })
+    })
+  })
 })

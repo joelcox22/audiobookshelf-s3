@@ -437,7 +437,11 @@ class LibraryScanner {
       }
     })
 
-    const libraryItemGrouping = scanUtils.groupFileItemsIntoLibraryItemDirs(library.mediaType, fileItems, library.settings?.audiobooksOnly)
+    const rawGrouping = scanUtils.groupFileItemsIntoLibraryItemDirs(library.mediaType, fileItems, library.settings?.audiobooksOnly)
+    // Expand flat groups: when multiple audio files share the same directory prefix they
+    // are split into individual items (one item per file).  This mirrors the local-library
+    // behaviour where files at the root of the library folder each become their own item.
+    const libraryItemGrouping = scanUtils.expandS3FlatGroups(rawGrouping, library.mediaType, library.settings?.audiobooksOnly)
 
     if (!Object.keys(libraryItemGrouping).length) {
       libraryScan.addLog(LogLevel.WARN, `S3 library "${library.name}" has no media items`)
@@ -451,7 +455,9 @@ class LibraryScanner {
     const items = []
     for (const libraryItemRelPath in libraryItemGrouping) {
       const files = libraryItemGrouping[libraryItemRelPath]
-      const isFile = libraryItemRelPath === files[0]
+      // Single-file items have a string value equal to the item's relative path;
+      // directory items (multi-part books) have an array value.
+      const isFile = !Array.isArray(files)
 
       // Determine path and metadata
       let itemRelPath = libraryItemRelPath
@@ -467,9 +473,14 @@ class LibraryScanner {
         itemPath = libraryClient.buildKey(itemRelPath)
       }
 
+      // Normalise to an array.
+      // - For single-file items the value is the full relative path (key === value).
+      // - For directory items the value is already an array of paths relative to the directory.
+      const filesArray = Array.isArray(files) ? files : [files]
+
       // Build LibraryFile objects from the S3 file items
       const libraryFiles = await Promise.all(
-        files.map(async (relFilePath) => {
+        filesArray.map(async (relFilePath) => {
           const fileItem = fileItems.find((fi) => fi.path === relFilePath || fi.path === Path.posix.join(libraryItemRelPath, relFilePath))
           const fullKey = fileItem?.fullpath || libraryClient.buildKey(relFilePath)
           const fileRelPath = isFile ? relFilePath : Path.posix.join(libraryItemRelPath, relFilePath)
