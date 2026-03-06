@@ -119,6 +119,11 @@ export default {
         folders: [],
         icon: 'database',
         mediaType: 'book',
+        storageType: 'local',
+        s3Bucket: null,
+        s3Region: null,
+        s3Endpoint: null,
+        s3KeyPrefix: null,
         settings: {
           coverAspectRatio: this.$constants.BookCoverAspectRatio.SQUARE,
           disableWatcher: false,
@@ -160,9 +165,16 @@ export default {
         this.$toast.error(this.$strings.ToastNameRequired)
         return false
       }
-      if (!this.libraryCopy.folders.length) {
-        this.$toast.error(this.$strings.ToastMustHaveAtLeastOnePath)
-        return false
+      if (this.libraryCopy.storageType === 's3') {
+        if (!this.libraryCopy.s3Bucket) {
+          this.$toast.error(this.$strings.ToastS3BucketRequired)
+          return false
+        }
+      } else {
+        if (!this.libraryCopy.folders.length) {
+          this.$toast.error(this.$strings.ToastMustHaveAtLeastOnePath)
+          return false
+        }
       }
 
       return true
@@ -197,8 +209,13 @@ export default {
               updatePayload.settings[settingsKey] = this.libraryCopy.settings[settingsKey]
             }
           }
-        } else if (key !== 'mediaType' && this.libraryCopy[key] !== this.library[key]) {
-          updatePayload[key] = this.libraryCopy[key]
+        } else if (key !== 'mediaType') {
+          // Treat null and undefined as equivalent when comparing to the existing library value
+          const copyVal = this.libraryCopy[key] ?? null
+          const libVal = this.library[key] ?? null
+          if (copyVal !== libVal) {
+            updatePayload[key] = this.libraryCopy[key]
+          }
         }
       }
       return updatePayload

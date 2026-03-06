@@ -135,3 +135,54 @@ module.exports.handleDownloadError = (error, res) => {
     }
   }
 }
+
+/**
+ * Creates a zip archive from an array of named readable streams and pipes it to the response.
+ * Useful for zipping S3 objects that are streamed from the cloud without being saved to disk.
+ *
+ * @param {{ name: string, stream: import('stream').Readable }[]} entries - Array of stream entries to zip.
+ * @param {string} filename - Name of the zip file to be sent as attachment.
+ * @param {Response} res - Response object to pipe the archive data to.
+ * @returns {Promise<void>}
+ */
+module.exports.zipStreamEntries = (entries, filename, res) => {
+  return new Promise((resolve, reject) => {
+    res.attachment(filename)
+
+    const archive = archiver('zip', {
+      zlib: { level: 0 }
+    })
+
+    res.on('close', () => {
+      Logger.info(archive.pointer() + ' total bytes')
+      Logger.debug('archiver has been finalized and the output file descriptor has closed.')
+      resolve()
+    })
+
+    res.on('end', () => {
+      Logger.debug('Data has been drained')
+    })
+
+    archive.on('warning', function (err) {
+      if (err.code === 'ENOENT') {
+        Logger.warn(`[zipStreamEntries] Archiver warning: ${err.message}`)
+      } else {
+        Logger.error(`[zipStreamEntries] Archiver error: ${err.message}`)
+        reject(err)
+      }
+    })
+
+    archive.on('error', function (err) {
+      Logger.error(`[zipStreamEntries] Archiver error: ${err.message}`)
+      reject(err)
+    })
+
+    archive.pipe(res)
+
+    for (const entry of entries) {
+      archive.append(entry.stream, { name: entry.name })
+    }
+
+    archive.finalize()
+  })
+}

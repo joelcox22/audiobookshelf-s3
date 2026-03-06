@@ -7,6 +7,8 @@ const Database = require('../Database')
 
 const { PlayMethod } = require('../utils/constants')
 const { getAudioMimeTypeFromExtname, encodeUriPath } = require('../utils/fileUtils')
+const { getLibraryS3Config } = require('../utils/storageUtils')
+const S3StorageManager = require('../managers/S3StorageManager')
 const zipHelpers = require('../utils/zipHelpers')
 
 const PlaybackSession = require('../objects/PlaybackSession')
@@ -155,6 +157,18 @@ class ShareController {
       return res.status(404).send('Cover image not found')
     }
 
+    // S3-backed library: redirect client directly to S3 via presigned URL
+    const { isS3Key } = require('../utils/storageUtils')
+    if (isS3Key(coverPath)) {
+      const s3Config = getLibraryS3Config(playbackSession.libraryId)
+      if (s3Config) {
+        const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+        const url = await libraryClient.getPresignedGetUrl(coverPath, S3StorageManager.presignedUrlTtlSeconds)
+        Logger.debug(`[ShareController] S3 redirect for shared item cover`)
+        return res.redirect(url)
+      }
+    }
+
     if (global.XAccel) {
       const encodedURI = encodeUriPath(global.XAccel + coverPath)
       Logger.debug(`Use X-Accel to serve static file ${encodedURI}`)
@@ -202,6 +216,16 @@ class ShareController {
       return res.status(204).header({ 'X-Accel-Redirect': encodedURI }).send()
     }
 
+    // S3-backed library: redirect client directly to S3 via presigned URL
+    const s3Config = getLibraryS3Config(playbackSession.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const key = libraryClient.buildKey(audioTrack.metadata.relPath)
+      const url = await libraryClient.getPresignedGetUrl(key, S3StorageManager.presignedUrlTtlSeconds)
+      Logger.debug(`[ShareController] S3 redirect for shared item audio track ${audioTrack.index}`)
+      return res.redirect(url)
+    }
+
     // Express does not set the correct mimetype for m4b files so use our defined mimetypes if available
     const audioMimeType = getAudioMimeTypeFromExtname(Path.extname(audioTrackPath))
     if (audioMimeType) {
@@ -239,7 +263,7 @@ class ShareController {
     }
 
     const libraryItem = await Database.libraryItemModel.findByPk(playbackSession.libraryItemId, {
-      attributes: ['id', 'path', 'relPath', 'isFile']
+      attributes: ['id', 'path', 'relPath', 'isFile', 'libraryId']
     })
     if (!libraryItem) {
       return res.status(404).send('Library item not found')
@@ -249,6 +273,42 @@ class ShareController {
     const itemTitle = playbackSession.displayTitle
 
     Logger.info(`[ShareController] Requested download for book "${itemTitle}" at "${itemPath}"`)
+
+    // S3-backed library: redirect single file or zip-from-S3 for multi-file
+    const s3Config = getLibraryS3Config(libraryItem.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      try {
+        if (libraryItem.isFile) {
+          const libraryFileFull = await Database.libraryItemModel.findByPk(libraryItem.id, { attributes: ['libraryFiles'] })
+          const primaryFile = libraryFileFull?.libraryFiles?.[0]
+          if (!primaryFile) {
+            return res.status(404).send('File not found')
+          }
+          const key = libraryClient.buildKey(primaryFile.metadata.relPath)
+          const url = await libraryClient.getPresignedGetUrl(key, S3StorageManager.presignedUrlTtlSeconds)
+          Logger.debug(`[ShareController] S3 redirect for shared item download "${itemTitle}"`)
+          return res.redirect(url)
+        } else {
+          const objects = await libraryClient.listObjects(libraryItem.relPath)
+          const filename = `${itemTitle}.zip`
+          const s3StreamEntries = []
+          for (const obj of objects) {
+            const relPath = libraryClient.keyToRelPath(obj.key)
+            s3StreamEntries.push({
+              name: relPath,
+              stream: await libraryClient.getObjectStream(obj.key)
+            })
+          }
+          await zipHelpers.zipStreamEntries(s3StreamEntries, filename, res)
+          Logger.info(`[ShareController] Downloaded S3 shared item "${itemTitle}"`)
+        }
+      } catch (error) {
+        Logger.error(`[ShareController] S3 download failed for shared item "${itemTitle}"`, error)
+        if (!res.headersSent) res.status(500).send('Failed to download the item')
+      }
+      return
+    }
 
     try {
       if (libraryItem.isFile) {

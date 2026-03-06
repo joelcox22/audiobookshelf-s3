@@ -10,6 +10,7 @@ const libraryItemFilters = require('../utils/queries/libraryItemFilters')
 const seriesFilters = require('../utils/queries/seriesFilters')
 const fileUtils = require('../utils/fileUtils')
 const { createNewSortInstance } = require('../libs/fastSort')
+const { refreshLibraryCache, removeLibraryFromCache } = require('../utils/storageUtils')
 const naturalSort = createNewSortInstance({
   comparer: new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }).compare
 })
@@ -57,16 +58,30 @@ class LibraryController {
     if (!req.body.name || typeof req.body.name !== 'string') {
       return res.status(400).send('Invalid request. Name must be a string')
     }
-    if (
-      !Array.isArray(req.body.folders) ||
-      req.body.folders.some((f) => {
-        // Old model uses fullPath and new model will use path. Support both for now
-        const path = f?.fullPath || f?.path
-        return !path || typeof path !== 'string'
-      })
-    ) {
-      return res.status(400).send('Invalid request. Folders must be a non-empty array of objects with path string')
+
+    const storageType = req.body.storageType || 'local'
+    const isS3Library = storageType === 's3'
+
+    // S3 libraries do not require local folders; local libraries require at least one
+    if (!isS3Library) {
+      if (
+        !Array.isArray(req.body.folders) ||
+        req.body.folders.some((f) => {
+          // Old model uses fullPath and new model will use path. Support both for now
+          const path = f?.fullPath || f?.path
+          return !path || typeof path !== 'string'
+        })
+      ) {
+        return res.status(400).send('Invalid request. Folders must be a non-empty array of objects with path string')
+      }
     }
+
+    if (isS3Library) {
+      if (!req.body.s3Bucket || typeof req.body.s3Bucket !== 'string') {
+        return res.status(400).send('Invalid request. s3Bucket must be a non-empty string for S3 libraries')
+      }
+    }
+
     const optionalStringFields = ['mediaType', 'icon', 'provider']
     for (const field of optionalStringFields) {
       if (req.body[field] && typeof req.body[field] !== 'string') {
@@ -83,7 +98,16 @@ class LibraryController {
       provider: req.body.provider || 'google',
       mediaType,
       icon: req.body.icon || 'database',
-      settings: Database.libraryModel.getDefaultLibrarySettingsForMediaType(mediaType)
+      settings: Database.libraryModel.getDefaultLibrarySettingsForMediaType(mediaType),
+      storageType
+    }
+
+    // S3 fields
+    if (isS3Library) {
+      newLibraryPayload.s3Bucket = req.body.s3Bucket
+      if (req.body.s3Region) newLibraryPayload.s3Region = req.body.s3Region
+      if (req.body.s3Endpoint) newLibraryPayload.s3Endpoint = req.body.s3Endpoint
+      if (req.body.s3KeyPrefix) newLibraryPayload.s3KeyPrefix = req.body.s3KeyPrefix
     }
 
     // Validate settings
@@ -130,19 +154,23 @@ class LibraryController {
 
     // Validate folder paths exist or can be created & resolve rel paths
     //   returns 400 if a folder fails to access
-    newLibraryPayload.libraryFolders = req.body.folders.map((f) => {
-      const fpath = f.fullPath || f.path
-      f.path = fileUtils.filePathToPOSIX(Path.resolve(fpath))
-      return f
-    })
-    for (const folder of newLibraryPayload.libraryFolders) {
-      try {
-        // Create folder if it doesn't exist
-        await fs.ensureDir(folder.path)
-      } catch (error) {
-        Logger.error(`[LibraryController] Failed to ensure folder dir "${folder.path}"`, error)
-        return res.status(400).send(`Invalid request. Invalid folder directory "${folder.path}"`)
+    if (!isS3Library) {
+      newLibraryPayload.libraryFolders = req.body.folders.map((f) => {
+        const fpath = f.fullPath || f.path
+        f.path = fileUtils.filePathToPOSIX(Path.resolve(fpath))
+        return f
+      })
+      for (const folder of newLibraryPayload.libraryFolders) {
+        try {
+          // Create folder if it doesn't exist
+          await fs.ensureDir(folder.path)
+        } catch (error) {
+          Logger.error(`[LibraryController] Failed to ensure folder dir "${folder.path}"`, error)
+          return res.status(400).send(`Invalid request. Invalid folder directory "${folder.path}"`)
+        }
       }
+    } else {
+      newLibraryPayload.libraryFolders = []
     }
 
     // Set display order
@@ -163,6 +191,9 @@ class LibraryController {
     }
 
     library.libraryFolders = await library.getLibraryFolders()
+
+    // Update in-memory storage config cache
+    refreshLibraryCache(library)
 
     // Only emit to users with access to library
     const userFilter = (user) => {
@@ -260,7 +291,7 @@ class LibraryController {
 
     // Validation
     const updatePayload = {}
-    const keysToCheck = ['name', 'provider', 'mediaType', 'icon']
+    const keysToCheck = ['name', 'provider', 'mediaType', 'icon', 'storageType']
     for (const key of keysToCheck) {
       if (!req.body[key]) continue
       if (typeof req.body[key] !== 'string') {
@@ -275,6 +306,18 @@ class LibraryController {
         return res.status(400).send('Invalid request. displayOrder must be a number')
       }
       updatePayload.displayOrder = req.body.displayOrder
+    }
+
+    // S3 fields update
+    const s3StringFields = ['s3Bucket', 's3Region', 's3Endpoint', 's3KeyPrefix']
+    for (const field of s3StringFields) {
+      if (req.body[field] !== undefined) {
+        if (req.body[field] !== null && typeof req.body[field] !== 'string') {
+          Logger.error(`[LibraryController] Invalid request. ${field} must be a string or null`)
+          return res.status(400).send(`Invalid request. ${field} must be a string or null`)
+        }
+        updatePayload[field] = req.body[field] || null
+      }
     }
 
     // Validate that the custom provider exists if given any
@@ -504,6 +547,9 @@ class LibraryController {
     }
 
     if (hasUpdates) {
+      // Update in-memory storage config cache
+      refreshLibraryCache(req.library)
+
       // Only emit to users with access to library
       const userFilter = (user) => {
         return user.checkCanAccessLibrary?.(req.library.id)
@@ -586,6 +632,9 @@ class LibraryController {
     await Database.libraryModel.resetDisplayOrder()
 
     SocketAuthority.emitter('library_removed', libraryJson)
+
+    // Remove library from in-memory storage config cache
+    removeLibraryFromCache(req.library.id)
 
     // Remove library filter data
     if (Database.libraryFilterData[req.library.id]) {

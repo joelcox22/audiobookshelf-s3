@@ -5,6 +5,8 @@ const Database = require('../Database')
 const { toNumber, isUUID } = require('../utils/index')
 const { getAudioMimeTypeFromExtname, encodeUriPath } = require('../utils/fileUtils')
 const { PlayMethod } = require('../utils/constants')
+const { getLibraryS3Config } = require('../utils/storageUtils')
+const S3StorageManager = require('../managers/S3StorageManager')
 
 const ShareManager = require('../managers/ShareManager')
 
@@ -319,6 +321,16 @@ class SessionController {
       const encodedURI = encodeUriPath(global.XAccel + audioTrack.metadata.path)
       Logger.debug(`Use X-Accel to serve static file ${encodedURI}`)
       return res.status(204).header({ 'X-Accel-Redirect': encodedURI }).send()
+    }
+
+    // S3-backed library: redirect client directly to S3 via presigned URL
+    const s3Config = getLibraryS3Config(playbackSession.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const key = libraryClient.buildKey(audioTrack.metadata.relPath)
+      const url = await libraryClient.getPresignedGetUrl(key, S3StorageManager.presignedUrlTtlSeconds)
+      Logger.debug(`[SessionController] S3 redirect for audio track ${audioTrack.index}`)
+      return res.redirect(url)
     }
 
     // Express does not set the correct mimetype for m4b files so use our defined mimetypes if available

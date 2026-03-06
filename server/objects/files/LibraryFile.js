@@ -73,5 +73,27 @@ class LibraryFile {
     this.addedAt = Date.now()
     this.updatedAt = Date.now()
   }
+
+  /**
+   * Populate this LibraryFile from S3 object metadata.
+   * The S3 object key is used as the stable inode equivalent.
+   *
+   * @param {string} key - Full S3 object key
+   * @param {string} relPath - Path relative to the library prefix
+   * @param {import('../../managers/S3StorageManager').S3LibraryClient} libraryClient
+   */
+  async setDataFromS3Key(key, relPath, libraryClient) {
+    const meta = await libraryClient.headObject(key)
+    const fileMetadata = new FileMetadata()
+    fileMetadata.filename = Path.basename(relPath)
+    fileMetadata.ext = Path.extname(relPath)
+    fileMetadata.path = key // S3 key stored as path in DB
+    fileMetadata.relPath = filePathToPOSIX(relPath)
+    fileMetadata.size = meta?.size ?? 0
+    this.ino = key // key is the stable identifier for S3 files
+    this.metadata = fileMetadata
+    this.addedAt = meta?.lastModified?.getTime() ?? Date.now()
+    this.updatedAt = this.addedAt
+  }
 }
 module.exports = LibraryFile

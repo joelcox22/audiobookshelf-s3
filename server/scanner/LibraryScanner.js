@@ -7,9 +7,11 @@ const Database = require('../Database')
 const fs = require('../libs/fsExtra')
 const fileUtils = require('../utils/fileUtils')
 const scanUtils = require('../utils/scandir')
+const globals = require('../utils/globals')
 const { LogLevel, ScanResult } = require('../utils/constants')
 const libraryFilters = require('../utils/queries/libraryFilters')
 const TaskManager = require('../managers/TaskManager')
+const S3StorageManager = require('../managers/S3StorageManager')
 const LibraryItemScanner = require('./LibraryItemScanner')
 const LibraryScan = require('./LibraryScan')
 const LibraryItemScanData = require('./LibraryItemScanData')
@@ -54,8 +56,15 @@ class LibraryScanner {
       return
     }
 
-    if (!library.libraryFolders.length) {
+    // S3 libraries don't require local folders; local libraries require at least one folder
+    if (library.storageType !== 's3' && !library.libraryFolders.length) {
       Logger.warn(`[LibraryScanner] Library has no folders to scan "${library.name}"`)
+      return
+    }
+
+    // S3 libraries must have a bucket configured
+    if (library.storageType === 's3' && !library.s3Bucket) {
+      Logger.warn(`[LibraryScanner] S3 library "${library.name}" has no bucket configured`)
       return
     }
 
@@ -148,12 +157,18 @@ class LibraryScanner {
     /** @type {LibraryItemScanData[]} */
     let libraryItemDataFound = []
 
-    // Scan each library folder
-    for (let i = 0; i < libraryScan.libraryFolders.length; i++) {
-      const folder = libraryScan.libraryFolders[i]
-      const itemDataFoundInFolder = await this.scanFolder(libraryScan.library, folder)
-      libraryScan.addLog(LogLevel.INFO, `${itemDataFoundInFolder.length} item data found in folder "${folder.path}"`)
-      libraryItemDataFound = libraryItemDataFound.concat(itemDataFoundInFolder)
+    if (libraryScan.library.storageType === 's3') {
+      // S3 library: list objects from S3 and build library item scan data
+      const itemDataFoundFromS3 = await this.scanS3Library(libraryScan.library, libraryScan)
+      libraryItemDataFound = libraryItemDataFound.concat(itemDataFoundFromS3)
+    } else {
+      // Scan each library folder
+      for (let i = 0; i < libraryScan.libraryFolders.length; i++) {
+        const folder = libraryScan.libraryFolders[i]
+        const itemDataFoundInFolder = await this.scanFolder(libraryScan.library, folder)
+        libraryScan.addLog(LogLevel.INFO, `${itemDataFoundInFolder.length} item data found in folder "${folder.path}"`)
+        libraryItemDataFound = libraryItemDataFound.concat(itemDataFoundInFolder)
+      }
     }
 
     if (this.shouldCancelScan(libraryScan)) return true
@@ -361,6 +376,168 @@ class LibraryScanner {
         })
       )
     }
+    return items
+  }
+
+  /**
+   * List all objects in an S3 library and build LibraryItemScanData objects.
+   * S3 libraries do not have library folders — files are grouped by their relative
+   * path under the library's key prefix, following the same conventions as local scan.
+   *
+   * @param {import('../models/Library')} library
+   * @param {import('./LibraryScan')} libraryScan
+   * @returns {Promise<LibraryItemScanData[]>}
+   */
+  async scanS3Library(library, libraryScan) {
+    const s3Config = library.s3Config
+    if (!s3Config) {
+      Logger.error(`[LibraryScanner] S3 library "${library.name}" has no valid S3 config`)
+      return []
+    }
+
+    const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+
+    libraryScan.addLog(LogLevel.INFO, `Listing S3 objects for library "${library.name}" (bucket: ${s3Config.bucket}, prefix: ${s3Config.keyPrefix || '(none)'})`)
+
+    let allObjects
+    try {
+      allObjects = await libraryClient.listObjects('')
+    } catch (err) {
+      Logger.error(`[LibraryScanner] Failed to list S3 objects for library "${library.name}"`, err)
+      return []
+    }
+
+    // Filter out the resize cache prefix (server-generated content)
+    const filtered = allObjects.filter((obj) => {
+      const rel = libraryClient.keyToRelPath(obj.key)
+      if (rel.startsWith('__resize_cache__/') || rel.includes('/__resize_cache__/')) {
+        return false
+      }
+      if (rel.startsWith('.abs/')) {
+        return false
+      }
+      return true
+    })
+
+    libraryScan.addLog(LogLevel.INFO, `Found ${filtered.length} S3 objects (after filtering cache/metadata)`)
+
+    // Convert S3 objects to a file-items array that scandir can group
+    const fileItems = filtered.map((obj) => {
+      const relPath = libraryClient.keyToRelPath(obj.key)
+      const dirname = Path.posix.dirname(relPath)
+      return {
+        name: Path.posix.basename(relPath),
+        fullpath: obj.key,
+        path: relPath,
+        reldirpath: dirname === '.' ? '' : dirname,
+        extension: Path.posix.extname(relPath).toLowerCase(),
+        deep: relPath.split('/').length - 1,
+        size: obj.size,
+        mtimeMs: obj.lastModified?.getTime() ?? 0
+      }
+    })
+
+    const rawGrouping = scanUtils.groupFileItemsIntoLibraryItemDirs(library.mediaType, fileItems, library.settings?.audiobooksOnly)
+    // Expand flat groups: when multiple audio files share the same directory prefix they
+    // are split into individual items (one item per file).  This mirrors the local-library
+    // behaviour where files at the root of the library folder each become their own item.
+    const libraryItemGrouping = scanUtils.expandS3FlatGroups(rawGrouping, library.mediaType, library.settings?.audiobooksOnly)
+
+    if (!Object.keys(libraryItemGrouping).length) {
+      libraryScan.addLog(LogLevel.WARN, `S3 library "${library.name}" has no media items`)
+      return []
+    }
+
+    // S3 libraries don't have local library folders. Use the first folder id if one exists
+    // (unlikely), otherwise null. The libraryFolderId column is nullable (onDelete: SET NULL).
+    const folderId = library.libraryFolders?.[0]?.id || null
+
+    const items = []
+    for (const libraryItemRelPath in libraryItemGrouping) {
+      const files = libraryItemGrouping[libraryItemRelPath]
+      // Single-file items have a string value equal to the item's relative path;
+      // directory items (multi-part books) have an array value.
+      const isFile = !Array.isArray(files)
+
+      // Determine path and metadata
+      let itemRelPath = libraryItemRelPath
+      let itemPath = libraryClient.buildKey(libraryItemRelPath) // S3 key acts as path
+      let mediaMetadata = null
+
+      if (isFile) {
+        mediaMetadata = { title: Path.basename(libraryItemRelPath, Path.extname(libraryItemRelPath)) }
+      } else {
+        const parsed = scanUtils.getDataFromMediaDir(library.mediaType, '', libraryItemRelPath)
+        mediaMetadata = parsed?.mediaMetadata || null
+        itemRelPath = parsed?.relPath || libraryItemRelPath
+        itemPath = libraryClient.buildKey(itemRelPath)
+      }
+
+      // Normalise to an array.
+      // - For single-file items the value is the full relative path (key === value).
+      // - For directory items the value is already an array of paths relative to the directory.
+      const filesArray = Array.isArray(files) ? files : [files]
+
+      // Build LibraryFile objects from the S3 file items
+      const libraryFiles = await Promise.all(
+        filesArray.map(async (relFilePath) => {
+          const fileItem = fileItems.find((fi) => fi.path === relFilePath || fi.path === Path.posix.join(libraryItemRelPath, relFilePath))
+          const fullKey = fileItem?.fullpath || libraryClient.buildKey(relFilePath)
+          const fileRelPath = isFile ? relFilePath : Path.posix.join(libraryItemRelPath, relFilePath)
+          const ext = Path.posix.extname(relFilePath)
+          const extclean = ext.slice(1).toLowerCase()
+          const isAudio = globals.SupportedAudioTypes.includes(extclean)
+
+          // Generate a presigned URL so AudioFileScanner can probe the file via HTTP
+          // instead of trying to read it as a local filesystem path
+          let probeUrl = null
+          if (isAudio) {
+            try {
+              probeUrl = await libraryClient.getPresignedGetUrl(fullKey)
+            } catch (err) {
+              Logger.warn(`[LibraryScanner] Failed to generate presigned URL for "${fullKey}": ${err.message}`)
+            }
+          }
+
+          return {
+            ino: fullKey,
+            probeUrl,
+            metadata: {
+              filename: Path.posix.basename(relFilePath),
+              ext,
+              path: fullKey,
+              relPath: fileRelPath,
+              size: fileItem?.size || 0
+            },
+            addedAt: fileItem?.mtimeMs || Date.now(),
+            updatedAt: fileItem?.mtimeMs || Date.now(),
+            isSupplementary: null
+          }
+        })
+      )
+
+      // Use the last modified time of any file in the item as the item's mtime
+      const mtimeMs = Math.max(...libraryFiles.map((lf) => lf.addedAt || 0))
+
+      items.push(
+        new LibraryItemScanData({
+          libraryFolderId: folderId,
+          libraryId: library.id,
+          mediaType: library.mediaType,
+          ino: itemPath, // use S3 key as inode equivalent
+          mtimeMs: mtimeMs || 0,
+          ctimeMs: 0,
+          birthtimeMs: 0,
+          path: itemPath,
+          relPath: itemRelPath,
+          isFile,
+          mediaMetadata: mediaMetadata || null,
+          libraryFiles
+        })
+      )
+    }
+
+    libraryScan.addLog(LogLevel.INFO, `${items.length} item data found in S3 library "${library.name}"`)
     return items
   }
 

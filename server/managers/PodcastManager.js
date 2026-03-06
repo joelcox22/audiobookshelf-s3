@@ -13,6 +13,8 @@ const opmlParser = require('../utils/parsers/parseOPML')
 const opmlGenerator = require('../utils/generators/opmlGenerator')
 const prober = require('../utils/prober')
 const ffmpegHelpers = require('../utils/ffmpegHelpers')
+const { getLibraryS3Config } = require('../utils/storageUtils')
+const S3StorageManager = require('./S3StorageManager')
 
 const TaskManager = require('./TaskManager')
 const CoverManager = require('../managers/CoverManager')
@@ -104,21 +106,26 @@ class PodcastManager {
     SocketAuthority.emitter('episode_download_started', podcastEpisodeDownload.toJSONForClient())
     this.currentDownload = podcastEpisodeDownload
 
+    // Determine if this is an S3-backed library upfront
+    const isS3 = !!getLibraryS3Config(this.currentDownload.libraryItem.libraryId)
+
     // If this file already exists then append a uuid to the filename
     //  e.g. "/tagesschau 20 Uhr.mp3" becomes "/tagesschau 20 Uhr (ep_asdfasdf).mp3"
     //  this handles podcasts where every title is the same (ref https://github.com/advplyr/audiobookshelf/issues/1802)
-    if (await fs.pathExists(this.currentDownload.targetPath)) {
+    if (!isS3 && (await fs.pathExists(this.currentDownload.targetPath))) {
       this.currentDownload.setAppendRandomId(true)
     }
 
-    // Ignores all added files to this dir
-    Watcher.addIgnoreDir(this.currentDownload.libraryItem.path)
-    Watcher.ignoreFilePathsDownloading.add(this.currentDownload.targetPath)
+    if (!isS3) {
+      // Ignores all added files to this dir
+      Watcher.addIgnoreDir(this.currentDownload.libraryItem.path)
+      Watcher.ignoreFilePathsDownloading.add(this.currentDownload.targetPath)
 
-    // Make sure podcast library item folder exists
-    if (!(await fs.pathExists(this.currentDownload.libraryItem.path))) {
-      Logger.warn(`[PodcastManager] Podcast episode download: Podcast folder no longer exists at "${this.currentDownload.libraryItem.path}" - Creating it`)
-      await fs.mkdir(this.currentDownload.libraryItem.path)
+      // Make sure podcast library item folder exists
+      if (!(await fs.pathExists(this.currentDownload.libraryItem.path))) {
+        Logger.warn(`[PodcastManager] Podcast episode download: Podcast folder no longer exists at "${this.currentDownload.libraryItem.path}" - Creating it`)
+        await fs.mkdir(this.currentDownload.libraryItem.path)
+      }
     }
 
     // Download episode and tag it
@@ -132,7 +139,7 @@ class PodcastManager {
       success = await this.scanAddPodcastEpisodeAudioFile()
       if (!success) {
         Logger.error(`[PodcastManager] Failed to scan and add podcast episode audio file - removing file`)
-        await fs.remove(this.currentDownload.targetPath)
+        if (!isS3) await fs.remove(this.currentDownload.targetPath)
       }
     }
 
@@ -154,7 +161,7 @@ class PodcastManager {
         success = await this.scanAddPodcastEpisodeAudioFile()
         if (!success) {
           Logger.error(`[PodcastManager] Failed to scan and add podcast episode audio file - removing file`)
-          await fs.remove(this.currentDownload.targetPath)
+          if (!isS3) await fs.remove(this.currentDownload.targetPath)
         }
       }
     }
@@ -176,9 +183,10 @@ class PodcastManager {
 
     SocketAuthority.emitter('episode_download_finished', this.currentDownload.toJSONForClient())
 
-    Watcher.removeIgnoreDir(this.currentDownload.libraryItem.path)
-
-    Watcher.ignoreFilePathsDownloading.delete(this.currentDownload.targetPath)
+    if (!isS3) {
+      Watcher.removeIgnoreDir(this.currentDownload.libraryItem.path)
+      Watcher.ignoreFilePathsDownloading.delete(this.currentDownload.targetPath)
+    }
     this.currentDownload = null
     if (this.downloadQueue.length) {
       this.startPodcastEpisodeDownload(this.downloadQueue.shift())
@@ -191,7 +199,24 @@ class PodcastManager {
    */
   async scanAddPodcastEpisodeAudioFile() {
     const libraryFile = new LibraryFile()
-    await libraryFile.setDataFromPath(this.currentDownload.targetPath, this.currentDownload.targetRelPath)
+
+    // S3-backed library: upload the downloaded file to S3, then set metadata from S3 headObject
+    const s3Config = getLibraryS3Config(this.currentDownload.libraryItem.libraryId)
+    if (s3Config) {
+      const libraryClient = S3StorageManager.getLibraryClient(s3Config)
+      const key = libraryClient.buildKey(this.currentDownload.targetRelPath)
+      // Upload to S3
+      const readStream = fs.createReadStream(this.currentDownload.targetPath)
+      await libraryClient.putObject(key, readStream)
+      // Remove local temp file
+      await fs.unlink(this.currentDownload.targetPath).catch((err) => {
+        Logger.warn(`[PodcastManager] Failed to remove temp file after S3 upload: ${err.message}`)
+      })
+      // Populate library file metadata from S3 headObject
+      await libraryFile.setDataFromS3Key(key, this.currentDownload.targetRelPath, libraryClient)
+    } else {
+      await libraryFile.setDataFromPath(this.currentDownload.targetPath, this.currentDownload.targetRelPath)
+    }
 
     const audioFile = await this.probeAudioFile(libraryFile)
     if (!audioFile) {

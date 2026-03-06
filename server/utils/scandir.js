@@ -122,6 +122,61 @@ function groupFileItemsIntoLibraryItemDirs(mediaType, fileItems, audiobooksOnly,
 module.exports.groupFileItemsIntoLibraryItemDirs = groupFileItemsIntoLibraryItemDirs
 
 /**
+ * Post-process a library item grouping for S3 libraries.
+ *
+ * When a directory group contains multiple direct-child media files (audio or ebook),
+ * each file is promoted to its own item using its full relative path as both the key
+ * and the value (matching the existing convention for root-level single-file items).
+ *
+ * This handles the common S3 pattern where individual books are placed under a
+ * shared prefix without a per-book subdirectory, e.g.:
+ *   "audiobooks/Book1.m4b", "audiobooks/Book2.m4b", …
+ *
+ * Multi-part books stored in their own per-book directory (e.g.
+ *   "Author/BookTitle/disc1.mp3", "Author/BookTitle/disc2.mp3")
+ * are unaffected because those files are only one deep relative to the directory.
+ * When a per-book directory contains multiple audio files but NO CD/disc
+ * sub-directories, each file is promoted to its own item. Use CD/disc sub-directories
+ * (e.g. "BookTitle/CD 1/part1.mp3") to keep multi-part books together in S3.
+ *
+ * @param {Record<string, string|string[]>} grouping - output of groupFileItemsIntoLibraryItemDirs
+ * @param {string} mediaType
+ * @param {boolean} [audiobooksOnly]
+ * @returns {Record<string, string|string[]>}
+ */
+function expandS3FlatGroups(grouping, mediaType, audiobooksOnly = false) {
+  const result = {}
+  for (const [key, value] of Object.entries(grouping)) {
+    if (!Array.isArray(value)) {
+      // Already a single-file item (root-level) — keep as-is
+      result[key] = value
+      continue
+    }
+
+    // Collect direct-child media files (no '/' in filename — not in a CD sub-directory)
+    const directMediaFiles = value.filter((f) => {
+      if (f.includes('/')) return false
+      return isMediaFile(mediaType, Path.posix.extname(f), audiobooksOnly)
+    })
+
+    if (directMediaFiles.length > 1) {
+      // Multiple individual media files in the same directory prefix.
+      // Promote each to its own library item using its full relative path.
+      for (const mediaFile of directMediaFiles) {
+        const fullRelPath = Path.posix.join(key, mediaFile)
+        result[fullRelPath] = fullRelPath
+      }
+      // Non-media files (covers, metadata) in the same flat directory are dropped;
+      // they cannot be reliably attributed to a single item in a flat structure.
+    } else {
+      result[key] = value
+    }
+  }
+  return result
+}
+module.exports.expandS3FlatGroups = expandS3FlatGroups
+
+/**
  * Get LibraryFile from filepath
  * @param {string} libraryItemPath
  * @param {string[]} files

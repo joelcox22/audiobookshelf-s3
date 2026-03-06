@@ -66,7 +66,7 @@ class LibraryItemScanData {
       birthtime: this.birthtimeMs,
       lastScan: Date.now(),
       lastScanVersion: packageJson.version,
-      libraryFiles: this.libraryFiles,
+      libraryFiles: this.libraryFiles.map(({ probeUrl, ...lf }) => lf),
       libraryId: this.libraryId,
       libraryFolderId: this.libraryFolderId,
       size

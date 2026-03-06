@@ -55,6 +55,13 @@ class FolderWatcher extends EventEmitter {
       Logger.warn('[Watcher] Already watching library', library.name)
       return
     }
+
+    // S3-backed libraries have no local filesystem to watch
+    if (library.storageType === 's3') {
+      Logger.info(`[Watcher] Skipping watcher for S3-backed library "${library.name}" — manual re-scan is required to pick up changes`)
+      return
+    }
+
     Logger.info(`[Watcher] Initializing watcher for "${library.name}".`)
 
     const folderPaths = library.libraryFolders.map((f) => f.path)
@@ -119,6 +126,8 @@ class FolderWatcher extends EventEmitter {
    */
   addLibrary(library) {
     if (this.disabled || library.settings.disableWatcher) return
+    // S3 libraries don't have a local filesystem to watch
+    if (library.storageType === 's3') return
     this.buildLibraryWatcher(library)
   }
 
