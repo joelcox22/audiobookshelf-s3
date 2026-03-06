@@ -16,7 +16,15 @@
         </div>
       </div>
 
-      <div class="folders-container overflow-y-auto w-full py-2 mb-2">
+      <!-- Storage Type -->
+      <div class="flex flex-wrap md:flex-nowrap -mx-1 mb-2">
+        <div class="w-full md:w-72 px-1 py-1 md:py-0">
+          <ui-dropdown v-model="storageType" :items="storageTypes" :label="$strings.LabelStorageType" :disabled="!isNew" small @input="changedStorageType" />
+        </div>
+      </div>
+
+      <!-- Local folders (shown when storageType is 'local') -->
+      <div v-if="isLocalStorage" class="folders-container overflow-y-auto w-full py-2 mb-2">
         <p class="px-1 text-sm font-semibold">{{ $strings.LabelFolders }}</p>
         <div v-for="(folder, index) in folders" :key="index" class="w-full flex items-center py-1 px-2">
           <span class="material-symbols fill mr-2 text-yellow-200" style="font-size: 1.2rem">folder</span>
@@ -27,8 +35,25 @@
           <span class="material-symbols fill mr-2 text-yellow-200" style="font-size: 1.2rem">folder</span>
           <ui-editable-text ref="newFolderInput" v-model="newFolderPath" :placeholder="$strings.PlaceholderNewFolderPath" type="text" class="w-full" @blur="newFolderInputBlurred" />
         </div>
-
         <ui-btn class="w-full mt-2" color="bg-primary" @click="browseForFolder">{{ $strings.ButtonBrowseForFolder }}</ui-btn>
+      </div>
+
+      <!-- S3 configuration (shown when storageType is 's3') -->
+      <div v-else class="w-full py-2 mb-2">
+        <div class="flex flex-wrap -mx-1">
+          <div class="w-full md:w-1/2 px-1 py-1">
+            <ui-text-input-with-label v-model="s3Bucket" :label="$strings.LabelS3Bucket" @blur="formUpdated" />
+          </div>
+          <div class="w-full md:w-1/2 px-1 py-1">
+            <ui-text-input-with-label v-model="s3Region" :label="$strings.LabelS3Region" @blur="formUpdated" />
+          </div>
+          <div class="w-full md:w-1/2 px-1 py-1">
+            <ui-text-input-with-label v-model="s3Endpoint" :label="$strings.LabelS3Endpoint" @blur="formUpdated" />
+          </div>
+          <div class="w-full md:w-1/2 px-1 py-1">
+            <ui-text-input-with-label v-model="s3KeyPrefix" :label="$strings.LabelS3KeyPrefix" @blur="formUpdated" />
+          </div>
+        </div>
       </div>
     </div>
     <modals-libraries-lazy-folder-chooser v-else :paths="folderPaths" @back="showDirectoryPicker = false" @select="selectFolder" />
@@ -53,7 +78,12 @@ export default {
       folders: [],
       showDirectoryPicker: false,
       newFolderPath: '',
-      mediaType: null
+      mediaType: null,
+      storageType: 'local',
+      s3Bucket: '',
+      s3Region: '',
+      s3Endpoint: '',
+      s3KeyPrefix: ''
     }
   },
   computed: {
@@ -68,6 +98,21 @@ export default {
           text: this.$strings.LabelPodcasts
         }
       ]
+    },
+    storageTypes() {
+      return [
+        {
+          value: 'local',
+          text: this.$strings.LabelStorageTypeLocal
+        },
+        {
+          value: 's3',
+          text: this.$strings.LabelStorageTypeS3
+        }
+      ]
+    },
+    isLocalStorage() {
+      return this.storageType !== 's3'
     },
     folderPaths() {
       return this.folders.map((f) => f.fullPath)
@@ -95,13 +140,21 @@ export default {
       this.showDirectoryPicker = true
     },
     getLibraryData() {
-      return {
+      const data = {
         name: this.name,
         provider: this.provider,
         folders: this.folders,
         icon: this.icon,
-        mediaType: this.mediaType
+        mediaType: this.mediaType,
+        storageType: this.storageType
       }
+      if (this.storageType === 's3') {
+        data.s3Bucket = this.s3Bucket || null
+        data.s3Region = this.s3Region || null
+        data.s3Endpoint = this.s3Endpoint || null
+        data.s3KeyPrefix = this.s3KeyPrefix || null
+      }
+      return data
     },
     formUpdated() {
       this.$emit('update', this.getLibraryData())
@@ -122,12 +175,15 @@ export default {
       this.formUpdated()
     },
     nameBlurred() {
-      if (this.name !== this.library.name) {
+      if (this.name !== (this.library ? this.library.name : '')) {
         this.formUpdated()
       }
     },
     changedMediaType() {
       this.provider = this.providers[0].value
+      this.formUpdated()
+    },
+    changedStorageType() {
       this.formUpdated()
     },
     selectFolder(fullPath) {
@@ -150,6 +206,11 @@ export default {
       this.folders = this.library ? this.library.folders.map((p) => ({ ...p })) : []
       this.icon = this.library ? this.library.icon : 'default'
       this.mediaType = this.library ? this.library.mediaType : 'book'
+      this.storageType = this.library ? (this.library.storageType || 'local') : 'local'
+      this.s3Bucket = this.library ? (this.library.s3Bucket || '') : ''
+      this.s3Region = this.library ? (this.library.s3Region || '') : ''
+      this.s3Endpoint = this.library ? (this.library.s3Endpoint || '') : ''
+      this.s3KeyPrefix = this.library ? (this.library.s3KeyPrefix || '') : ''
 
       this.showDirectoryPicker = false
     }

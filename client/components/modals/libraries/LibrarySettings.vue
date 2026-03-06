@@ -10,7 +10,7 @@
           </p>
         </ui-tooltip>
       </div>
-      <div class="p-2 w-full md:w-1/2">
+      <div v-if="!isS3Library" class="p-2 w-full md:w-1/2">
         <div class="flex items-center">
           <ui-toggle-switch v-if="!globalWatcherDisabled" v-model="enableWatcher" size="sm" @input="formUpdated" />
           <ui-toggle-switch v-else disabled size="sm" :value="false" />
@@ -132,6 +132,9 @@ export default {
     },
     isPodcastLibrary() {
       return this.mediaType === 'podcast'
+    },
+    isS3Library() {
+      return this.library?.storageType === 's3'
     },
     maskAsFinishedWhenItems() {
       return [
